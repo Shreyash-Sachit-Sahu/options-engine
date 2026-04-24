@@ -1,0 +1,54 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ─── C++ Build ────────────────────────────────────────────────────────────────
+build/
+*.o
+*.so
+*.pyd
+*.dll
+*.lib
+*.exp
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ─── RL Models ────────────────────────────────────────────────────────────────
+agent/models/checkpoints/
+agent/models/best/
+agent/models/*.zip
+agent/models/*.pkl
+tb_logs/
+*.zip
+
+# ─── Data ─────────────────────────────────────────────────────────────────────
+*.csv
+*.parquet
+data/
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Env ──────────────────────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+env/

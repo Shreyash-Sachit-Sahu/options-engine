@@ -1,0 +1,149 @@
+name: CI — Options Pricing Engine
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── 1. Build C++ Pricer ──────────────────────────────────────────────────
+  build_cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pybind11 numpy scipy
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -Dpybind11_DIR=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify module loads
+        run: python -c "import pricer; print(pricer.bs_call(100,100,1,0.05,0.2))"
+
+      - name: Upload pricer module
+        uses: actions/upload-artifact@v4
+        with:
+          name: pricer-module
+          path: "*.so"
+
+  # ─── 2. Python Tests ─────────────────────────────────────────────────────
+  test_python:
+    runs-on: ubuntu-latest
+    needs: build_cpp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov httpx
+
+      - name: Download pricer module
+        uses: actions/download-artifact@v4
+        with:
+          name: pricer-module
+
+      - name: Run pricer tests
+        run: |
+          python -m pytest tests/test_pricer.py -v --tb=short
+
+      - name: Run environment tests
+        run: |
+          python -m pytest tests/test_environment.py -v --tb=short
+
+      - name: Run API tests
+        run: |
+          python -m pytest tests/test_api.py -v --tb=short
+
+      - name: Coverage report
+        run: |
+          python -m pytest tests/ --cov=src --cov=environment --cov=api \
+            --cov-report=term-missing -v
+
+  # ─── 3. Benchmark ────────────────────────────────────────────────────────
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: build_cpp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pybind11 numpy scipy
+
+      - name: Download pricer module
+        uses: actions/download-artifact@v4
+        with:
+          name: pricer-module
+
+      - name: Run benchmark
+        run: |
+          python -c "
+          import pricer, time
+          n = 1_000_000
+          start = time.perf_counter()
+          for _ in range(n):
+              pricer.bs_call(100, 100, 1, 0.05, 0.2)
+          elapsed = time.perf_counter() - start
+          print(f'{n:,} BSM calls: {elapsed*1000:.1f}ms ({elapsed/n*1e6:.3f}μs/call)')
+          assert elapsed < 0.5, f'Benchmark FAILED: {elapsed*1000:.0f}ms > 400ms'
+          print('✅ Benchmark PASSED')
+          "
+
+  # ─── 4. Backtest CI ──────────────────────────────────────────────────────
+  backtest_ci:
+    runs-on: ubuntu-latest
+    needs: test_python
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download pricer module
+        uses: actions/download-artifact@v4
+        with:
+          name: pricer-module
+
+      - name: Run baseline backtest
+        run: |
+          python -c "
+          from environment.options_env import OptionsHedgingEnv
+          from environment.baselines import DeltaHedger, evaluate_agent
+
+          env = OptionsHedgingEnv(seed=42)
+          agent = DeltaHedger()
+          result = evaluate_agent(env, agent, n_episodes=200)
+
+          print(f'DeltaHedger Sharpe: {result[\"sharpe_ratio\"]:.4f}')
+          assert result['sharpe_ratio'] > 0.3, 'Baseline Sharpe too low'
+          print('✅ Baseline backtest PASSED')
+          "
