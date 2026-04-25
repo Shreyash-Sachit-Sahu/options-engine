@@ -466,7 +466,8 @@ def train(args):
     test_env.norm_reward = False
 
     for ep in range(100):
-        obs = test_env.reset(seed=42000 + ep)   # unique seed per episode
+        test_env.envs[0].reset(seed=42000 + ep)
+        obs = test_env.reset()  # unique seed per episode
         done = False
         ep_reward = 0.0
 
