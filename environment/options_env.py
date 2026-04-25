@@ -202,6 +202,7 @@ class OptionsHedgingEnv(gym.Env):
         # Use step PnL variance approximation
         pnl_variance = total_pnl ** 2  # instantaneous variance proxy
         reward = -0.5 * pnl_variance - tc
+        reward -= 0.01 * abs(self.hedge_position)
 
         # ── 6. Termination conditions ─────────────────────────────────────
         terminated = False

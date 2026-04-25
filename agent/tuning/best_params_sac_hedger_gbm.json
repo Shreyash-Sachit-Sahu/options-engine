@@ -1,0 +1,19 @@
+{
+  "study_name": "sac_hedger_gbm",
+  "best_trial": 12,
+  "best_sharpe_proxy": 255671748809.59525,
+  "params": {
+    "lr": 0.0003231870156021599,
+    "batch_size": 128,
+    "buffer_size": 100000,
+    "tau": 0.0017678862187588949,
+    "gamma": 0.9768856764960467,
+    "net_width": 64,
+    "net_depth": 1,
+    "ent_coef": 0.05,
+    "learning_starts": 2000
+  },
+  "arch": [
+    64
+  ]
+}
