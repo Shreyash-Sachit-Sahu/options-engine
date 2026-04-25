@@ -1,0 +1,19 @@
+{
+  "study_name": "sac_hedger_heston",
+  "best_trial": 0,
+  "best_sharpe_proxy": -999.0,
+  "params": {
+    "lr": 5.6115164153345e-05,
+    "batch_size": 64,
+    "buffer_size": 200000,
+    "tau": 0.006054365855469245,
+    "gamma": 0.9853328216320226,
+    "net_width": 128,
+    "net_depth": 1,
+    "ent_coef": 0.1,
+    "learning_starts": 1000
+  },
+  "arch": [
+    128
+  ]
+}

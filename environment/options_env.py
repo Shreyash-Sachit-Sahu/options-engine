@@ -201,13 +201,17 @@ class OptionsHedgingEnv(gym.Env):
         # ── 5. Reward: minimize variance + transaction costs ──────────────
         # Use step PnL variance approximation
         pnl_variance = total_pnl ** 2  # instantaneous variance proxy
-        reward = -0.5 * pnl_variance - tc
-        reward -= 0.01 * abs(self.hedge_position)
-        reward += 0.05 * total_pnl
-        reward = -0.5 * pnl_variance - tc
-        reward += 0.05 * total_pnl
-        reward -= 0.01 * abs(self.hedge_position)
+        # Variance penalty
+        reward = -0.5 * pnl_variance
 
+        # Encourage meaningful PnL
+        reward += 0.1 * total_pnl
+
+        # Penalize overtrading
+        reward -= tc
+
+        # Penalize inactivity (VERY IMPORTANT)
+        reward -= 0.01 * abs(self.hedge_position)
         # ── 6. Termination conditions ─────────────────────────────────────
         terminated = False
         truncated = False

@@ -198,9 +198,18 @@ class DynamicHPController(BaseCallback):
 
         # Update learning rate in model and optimizer directly
         self.model.learning_rate = new_lr
-        for param_group in self.model.policy.optimizer.param_groups:
+        # Update actor optimizer
+        for param_group in self.model.actor.optimizer.param_groups:
             param_group["lr"] = new_lr
 
+        # Update critic optimizer
+        for param_group in self.model.critic.optimizer.param_groups:
+            param_group["lr"] = new_lr
+
+        # Update entropy optimizer (if using auto)
+        if hasattr(self.model, "ent_coef_optimizer") and self.model.ent_coef_optimizer is not None:
+            for param_group in self.model.ent_coef_optimizer.param_groups:
+                param_group["lr"] = new_lr
         self.logger.record("dynamic_hp/learning_rate", new_lr)
 
         # Announce warm restarts
