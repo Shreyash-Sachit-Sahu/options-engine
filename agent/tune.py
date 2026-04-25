@@ -140,7 +140,7 @@ def evaluate_trial(model: SAC, train_env: VecNormalize,
     pnls = np.array(pnls)
     std = np.std(pnls)
 
-    if std < 1e-3:
+    if std < 1e-3 or abs(np.mean(pnls)) < 1e-3:
         return -999.0  # reject degenerate policies
 
     sharpe = np.mean(pnls) / std * np.sqrt(252)

@@ -203,6 +203,10 @@ class OptionsHedgingEnv(gym.Env):
         pnl_variance = total_pnl ** 2  # instantaneous variance proxy
         reward = -0.5 * pnl_variance - tc
         reward -= 0.01 * abs(self.hedge_position)
+        reward += 0.05 * total_pnl
+        reward = -0.5 * pnl_variance - tc
+        reward += 0.05 * total_pnl
+        reward -= 0.01 * abs(self.hedge_position)
 
         # ── 6. Termination conditions ─────────────────────────────────────
         terminated = False
@@ -274,9 +278,12 @@ class OptionsHedgingEnv(gym.Env):
         # Add Sharpe ratio at episode end
         if len(self.pnl_history) > 1:
             returns = np.array(self.pnl_history)
-            info["episode_sharpe"] = (
-                float(np.mean(returns) / (np.std(returns) + 1e-10) * np.sqrt(252))
-            )
+            if np.std(returns) < 1e-6:
+                info["episode_sharpe"] = 0.0
+            else:
+                info["episode_sharpe"] = float(
+                    np.mean(returns) / np.std(returns) * np.sqrt(252)
+                )
             info["total_pnl"] = float(np.sum(returns))
             info["max_drawdown"] = float(self._compute_max_drawdown())
 
