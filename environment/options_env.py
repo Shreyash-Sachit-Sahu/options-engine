@@ -144,7 +144,7 @@ class OptionsHedgingEnv(gym.Env):
         self.portfolio_value = self.option_premium
         self.prev_portfolio_value = self.portfolio_value
 
-        return self._get_obs(), self._get_info()
+        return self._get_obs(), self._get_info(episode_done=False)
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
@@ -233,7 +233,7 @@ class OptionsHedgingEnv(gym.Env):
 
         self.prev_portfolio_value = self.portfolio_value
 
-        return self._get_obs(), float(reward), terminated, truncated, self._get_info()
+        return self._get_obs(), float(reward), terminated, truncated, self._get_info(episode_done=terminated)
 
     def _get_obs(self) -> np.ndarray:
         """Construct observation vector."""
@@ -264,8 +264,16 @@ class OptionsHedgingEnv(gym.Env):
             np.clip(pnl_normalised, -10, 10),
         ], dtype=np.float32)
 
-    def _get_info(self) -> Dict[str, Any]:
-        """Return episode info dict with correct PnL metrics."""
+    def _get_info(self, episode_done: bool = False) -> Dict[str, Any]:
+        """
+        Return episode info dict.
+
+        episode_sharpe, total_pnl, and max_drawdown are only populated
+        when episode_done=True (at termination). Emitting them at every
+        step caused the DHP entropy controller to read mid-episode
+        2-step Sharpe values (can be 100+) as real signal, corrupting
+        the training dynamics.
+        """
         T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
 
         info = {
@@ -278,12 +286,11 @@ class OptionsHedgingEnv(gym.Env):
             "T_remaining": T_remaining,
         }
 
-        # FIX: compute Sharpe and total_pnl from raw dollar PnL
-        # Previous version standardised pnls first, causing:
-        #   1. episode_sharpe always 0.0 (condition never fired)
-        #   2. total_pnl was sum of standardised values, not actual PnL
-        if len(self.pnl_history) > 1:
-            pnls = np.array(self.pnl_history)   # raw dollar PnL per step
+        # Only compute episode-level metrics at true episode end.
+        # Mid-episode values from 2-5 steps are statistically meaningless
+        # and produce enormous spurious Sharpe ratios.
+        if episode_done and len(self.pnl_history) > 1:
+            pnls = np.array(self.pnl_history)
             pnl_std = float(np.std(pnls))
 
             if pnl_std > 1e-8:
@@ -293,7 +300,7 @@ class OptionsHedgingEnv(gym.Env):
             else:
                 info["episode_sharpe"] = 0.0
 
-            info["total_pnl"] = float(np.sum(pnls))   # actual cumulative PnL
+            info["total_pnl"] = float(np.sum(pnls))
             info["max_drawdown"] = float(self._compute_max_drawdown())
 
         return info

@@ -1,19 +1,19 @@
 {
   "study_name": "sac_hedger_gbm",
-  "best_trial": 42,
-  "best_sharpe_proxy": 1.5922370798446197,
+  "best_trial": 38,
+  "best_sharpe_proxy": 2.903427980779975,
   "params": {
-    "lr": 1.5195392373247892e-05,
-    "batch_size": 256,
+    "lr": 1.2341911297347582e-05,
+    "batch_size": 512,
     "buffer_size": 200000,
-    "tau": 0.008065222738051565,
-    "gamma": 0.9725975307910669,
-    "net_width": 64,
+    "tau": 0.007599438099660349,
+    "gamma": 0.9809745219300394,
+    "net_width": 256,
     "net_depth": 1,
-    "ent_coef": 0.1,
-    "learning_starts": 500
+    "ent_coef": 0.05,
+    "learning_starts": 1000
   },
   "arch": [
-    64
+    256
   ]
 }

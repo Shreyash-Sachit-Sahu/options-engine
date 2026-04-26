@@ -367,7 +367,7 @@ def train(args):
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── Model ────────────────────────────────────────────────────────────
-    policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
+    policy_kwargs = dict(net_arch=dict(pi=[256], qf=[256]))
     ent_coef_auto = (args.ent_coef == "auto")
 
     model = SAC(
