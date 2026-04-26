@@ -196,20 +196,23 @@ class DynamicHPController(BaseCallback):
     def _update_lr(self):
         new_lr = self._cosine_lr()
 
-        # Update learning rate in model and optimizer directly
+        # SAC has separate optimizers for actor and critic — there is no
+        # single policy.optimizer. Update each one individually.
         self.model.learning_rate = new_lr
-        # Update actor optimizer
-        for param_group in self.model.actor.optimizer.param_groups:
-            param_group["lr"] = new_lr
 
-        # Update critic optimizer
-        for param_group in self.model.critic.optimizer.param_groups:
-            param_group["lr"] = new_lr
+        policy = self.model.policy
+        optimizers = []
+        if hasattr(policy, 'actor') and hasattr(policy.actor, 'optimizer'):
+            optimizers.append(policy.actor.optimizer)
+        if hasattr(policy, 'critic') and hasattr(policy.critic, 'optimizer'):
+            optimizers.append(policy.critic.optimizer)
+        if hasattr(policy, 'ent_coef_optimizer'):
+            optimizers.append(policy.ent_coef_optimizer)
 
-        # Update entropy optimizer (if using auto)
-        if hasattr(self.model, "ent_coef_optimizer") and self.model.ent_coef_optimizer is not None:
-            for param_group in self.model.ent_coef_optimizer.param_groups:
+        for opt in optimizers:
+            for param_group in opt.param_groups:
                 param_group["lr"] = new_lr
+
         self.logger.record("dynamic_hp/learning_rate", new_lr)
 
         # Announce warm restarts
@@ -466,8 +469,9 @@ def train(args):
     test_env.norm_reward = False
 
     for ep in range(100):
-        test_env.envs[0].reset(seed=42000 + ep)
-        obs = test_env.reset()  # unique seed per episode
+        # VecNormalize doesn't accept seed in reset() — set it separately
+        test_env.seed(42000 + ep)
+        obs = test_env.reset()
         done = False
         ep_reward = 0.0
 

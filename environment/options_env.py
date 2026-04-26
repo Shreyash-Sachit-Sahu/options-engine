@@ -19,7 +19,6 @@ import sys
 import os
 from typing import Optional, Dict, Any, Tuple
 
-# Add project root to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.pricer.pricer_py import bs_call, greeks_call
@@ -31,31 +30,36 @@ class OptionsHedgingEnv(gym.Env):
     Options Hedging Environment for Reinforcement Learning.
 
     The agent sells an at-the-money call option and must hedge it by
-    trading the underlying asset. The goal is to minimize PnL variance
+    trading the underlying asset. The goal is to minimise PnL variance
     (i.e., hedge as perfectly as possible) while managing transaction costs.
 
     Observation Space (7-dim):
-        [0] S/S0           — normalized spot price
-        [1] K/S0           — normalized strike
+        [0] S/S0           — normalised spot price
+        [1] K/S0           — normalised strike
         [2] T_rem/T_total  — remaining time fraction
-        [3] sigma          — current implied/realized volatility
-        [4] delta           — Black-Scholes delta
-        [5] gamma           — Black-Scholes gamma
-        [6] portfolio_pnl   — normalized portfolio PnL
+        [3] sigma          — current implied/realised volatility
+        [4] delta          — Black-Scholes delta
+        [5] gamma          — Black-Scholes gamma
+        [6] portfolio_pnl  — normalised portfolio PnL
 
     Action Space:
-        Box([-1], [1]) — target hedge ratio
-          +1 = fully long underlying (fully hedged short call)
-          -1 = fully short underlying (double short exposure)
-           0 = no hedge
+        Box([-1], [1]) — delta adjustment
+          The agent outputs a correction to the BS delta:
+            target_hedge = clip(delta + 0.3 * action, -1, 1)
+          action =  0 -> pure delta hedge
+          action =  1 -> over-hedge by 0.3
+          action = -1 -> under-hedge by 0.3
 
-    Reward:
-        -0.5 * portfolio_variance_this_step - transaction_cost
-        Encourages stable, efficient hedging.
+    Reward (5 components):
+        -0.1 * pnl^2          variance penalty
+        +0.02 * pnl           small PnL incentive
+        -tc                   transaction cost
+        -0.5 * hedge_error    core: distance from BS delta
+        -0.01 * |dposition|   smooth trading bonus
 
     Episode:
         30 trading days (option lifetime). Terminates early if
-        portfolio value drops below -3 × initial premium.
+        portfolio value drops below -3 x initial premium.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -65,14 +69,13 @@ class OptionsHedgingEnv(gym.Env):
         simulator_type: str = "gbm",
         S0: float = 100.0,
         K: float = 100.0,
-        T: float = 30 / 252,       # 30 trading days
+        T: float = 30 / 252,
         r: float = 0.05,
         sigma: float = 0.2,
         mu: float = 0.05,
         n_steps: int = 30,
         transaction_cost: float = 0.001,
         seed: Optional[int] = None,
-        # Heston params
         kappa: float = 2.0,
         theta: float = 0.04,
         xi: float = 0.3,
@@ -82,7 +85,6 @@ class OptionsHedgingEnv(gym.Env):
         super().__init__()
         self.render_mode = render_mode
 
-        # Option parameters
         self.S0 = S0
         self.K = K
         self.T = T
@@ -92,7 +94,6 @@ class OptionsHedgingEnv(gym.Env):
         self.dt = T / n_steps
         self.tc_rate = transaction_cost
 
-        # Create market simulator
         self.simulator_type = simulator_type
         if simulator_type == "heston":
             self.simulator = HestonSimulator(
@@ -104,21 +105,17 @@ class OptionsHedgingEnv(gym.Env):
                 S0=S0, mu=mu, sigma=sigma, dt=self.dt, seed=seed
             )
 
-        # Spaces — Gymnasium API
-        # Observation: [S/S0, K/S0, T_rem/T, sigma, delta, gamma, pnl]
         self.observation_space = spaces.Box(
             low=np.array([0.0, 0.0, 0.0, 0.0, -1.0, 0.0, -np.inf], dtype=np.float32),
-            high=np.array([5.0, 5.0, 1.0, 5.0, 1.0, np.inf, np.inf], dtype=np.float32),
+            high=np.array([5.0, 5.0, 1.0, 5.0,  1.0, np.inf, np.inf], dtype=np.float32),
             dtype=np.float32
         )
-        # Action: hedge ratio in [-1, 1]
         self.action_space = spaces.Box(
             low=np.array([-1.0], dtype=np.float32),
             high=np.array([1.0], dtype=np.float32),
             dtype=np.float32
         )
 
-        # Episode state (initialized in reset)
         self.current_step = 0
         self.price = S0
         self.current_vol = sigma
@@ -128,12 +125,11 @@ class OptionsHedgingEnv(gym.Env):
         self.pnl_history = []
         self.prev_portfolio_value = 0.0
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None
-              ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def reset(self, seed: Optional[int] = None,
+              options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reset the environment for a new episode."""
         super().reset(seed=seed)
 
-        # Reset market simulator
         if seed is not None:
             self.price = self.simulator.reset(seed=seed)
         else:
@@ -144,129 +140,132 @@ class OptionsHedgingEnv(gym.Env):
         self.hedge_position = 0.0
         self.pnl_history = []
 
-        # Sell an ATM call option — collect premium
         self.option_premium = bs_call(self.price, self.K, self.T, self.r, self.sigma)
         self.portfolio_value = self.option_premium
         self.prev_portfolio_value = self.portfolio_value
 
-        obs = self._get_obs()
-        info = self._get_info()
-
-        return obs, info
+        return self._get_obs(), self._get_info()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute one time step.
 
-        1. Apply hedge action (trade underlying)
-        2. Advance market (simulate next price)
-        3. Mark-to-market portfolio
-        4. Compute reward
+        1. Compute BS delta at current state
+        2. Apply hedge as delta + 0.3 * rl_adjustment
+        3. Deduct transaction cost for position change
+        4. Simulate next market state
+        5. Mark-to-market portfolio
+        6. Compute shaped reward
         """
         self.current_step += 1
         old_price = self.price
-        target_hedge = float(np.clip(action[0], -1.0, 1.0))
+        T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
 
-        # ── 1. Transaction cost for changing position ──────────────────────
+        # ── 1. BS delta at current state ──────────────────────────────────
+        try:
+            g = greeks_call(old_price, self.K, T_remaining + self.dt,
+                            self.r, self.current_vol)
+            delta = g.delta
+        except Exception:
+            delta = 0.5
+
+        # ── 2. Target hedge: delta + small RL correction ──────────────────
+        rl_adjustment = float(action[0])
+        target_hedge = float(np.clip(delta + 0.3 * rl_adjustment, -1.0, 1.0))
+
+        # ── 3. Transaction cost ───────────────────────────────────────────
         position_change = abs(target_hedge - self.hedge_position)
         tc = self.tc_rate * position_change * old_price
         self.portfolio_value -= tc
-
-        # ── 2. Update hedge position ──────────────────────────────────────
         old_hedge = self.hedge_position
         self.hedge_position = target_hedge
 
-        # ── 3. Simulate next market state ─────────────────────────────────
+        # ── 4. Simulate next price ────────────────────────────────────────
         self.price, self.current_vol = self.simulator.step()
 
-        # ── 4. Mark-to-market ─────────────────────────────────────────────
+        # ── 5. Mark-to-market ─────────────────────────────────────────────
         price_change = self.price - old_price
-        T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
 
-        # PnL from hedge: long hedge_position units of underlying
+        # PnL from hedge position (long underlying)
         hedge_pnl = self.hedge_position * price_change
 
-        # PnL from option: we are SHORT the call
+        # PnL from short call (mark-to-market)
         old_option_val = bs_call(old_price, self.K,
                                  T_remaining + self.dt, self.r, self.current_vol)
         new_option_val = bs_call(self.price, self.K,
                                  T_remaining, self.r, self.current_vol)
-        option_pnl = -(new_option_val - old_option_val)  # short position
+        option_pnl = -(new_option_val - old_option_val)
 
-        # Total portfolio change
+        # FIX: store actual dollar PnL per step — no standardisation
         total_pnl = hedge_pnl + option_pnl
         self.portfolio_value += total_pnl
         self.pnl_history.append(total_pnl)
 
-        # ── 5. Reward: minimize variance + transaction costs ──────────────
-        # Use step PnL variance approximation
-        pnl_variance = total_pnl ** 2  # instantaneous variance proxy
-        # Variance penalty
-        reward = -0.5 * pnl_variance
+        # ── 6. Reward ──────────────────────────────────────────────────────
+        # Re-compute delta at new state for hedge error signal
+        try:
+            g_new = greeks_call(self.price, self.K, T_remaining,
+                                self.r, self.current_vol)
+            delta_new = g_new.delta
+        except Exception:
+            delta_new = 0.5
 
-        # Encourage meaningful PnL
-        reward += 0.1 * total_pnl
+        hedge_error = abs(delta_new - self.hedge_position)
 
-        # Penalize overtrading
-        reward -= tc
+        reward  = -0.1 * (total_pnl ** 2)                          # variance penalty
+        reward += 0.02 * total_pnl                                  # PnL incentive
+        reward -= tc                                                 # transaction cost
+        reward -= 0.5 * hedge_error                                 # hedge accuracy
+        reward -= 0.01 * abs(self.hedge_position - old_hedge)       # smooth trading
 
-        # Penalize inactivity (VERY IMPORTANT)
-        reward -= 0.01 * abs(self.hedge_position)
-        # ── 6. Termination conditions ─────────────────────────────────────
+        # ── 7. Termination ────────────────────────────────────────────────
         terminated = False
         truncated = False
 
-        # Episode ends at option expiry
         if self.current_step >= self.n_steps:
-            # Final settlement
             intrinsic = max(self.price - self.K, 0.0)
-            self.portfolio_value -= intrinsic  # pay out option if ITM
+            self.portfolio_value -= intrinsic
             terminated = True
 
-        # Early termination: catastrophic loss
         if self.portfolio_value < -3.0 * self.option_premium:
             terminated = True
-            reward -= 10.0  # large penalty
+            reward -= 10.0
 
         self.prev_portfolio_value = self.portfolio_value
 
-        obs = self._get_obs()
-        info = self._get_info()
-
-        return obs, float(reward), terminated, truncated, info
+        return self._get_obs(), float(reward), terminated, truncated, self._get_info()
 
     def _get_obs(self) -> np.ndarray:
         """Construct observation vector."""
         T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
         T_fraction = T_remaining / self.T
 
-        # Compute Greeks
         try:
             g = greeks_call(self.price, self.K, T_remaining,
-                           self.r, self.current_vol)
+                            self.r, self.current_vol)
             delta = g.delta
             gamma = g.gamma
         except Exception:
             delta = 0.5
             gamma = 0.01
 
-        # Normalized PnL
-        pnl_normalized = (self.portfolio_value - self.option_premium) / max(self.option_premium, 1e-6)
+        pnl_normalised = (
+            (self.portfolio_value - self.option_premium)
+            / max(self.option_premium, 1e-6)
+        )
 
-        obs = np.array([
-            self.price / self.S0,       # Normalized spot
-            self.K / self.S0,           # Normalized strike
-            T_fraction,                  # Time remaining fraction
-            self.current_vol,            # Current volatility
-            delta,                       # BS delta
-            gamma,                       # BS gamma
-            np.clip(pnl_normalized, -10, 10)  # Normalized PnL (clipped)
+        return np.array([
+            self.price / self.S0,
+            self.K / self.S0,
+            T_fraction,
+            self.current_vol,
+            delta,
+            gamma,
+            np.clip(pnl_normalised, -10, 10),
         ], dtype=np.float32)
 
-        return obs
-
     def _get_info(self) -> Dict[str, Any]:
-        """Return episode info dict."""
+        """Return episode info dict with correct PnL metrics."""
         T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
 
         info = {
@@ -279,15 +278,22 @@ class OptionsHedgingEnv(gym.Env):
             "T_remaining": T_remaining,
         }
 
-        # Add Sharpe ratio at episode end
+        # FIX: compute Sharpe and total_pnl from raw dollar PnL
+        # Previous version standardised pnls first, causing:
+        #   1. episode_sharpe always 0.0 (condition never fired)
+        #   2. total_pnl was sum of standardised values, not actual PnL
         if len(self.pnl_history) > 1:
-            pnls = np.array(self.pnl_history)
-            returns = pnls/ (np.std(pnls)+1e-6)
-            if np.std(returns) > 1 and np.std(returns) >1e-6:
-                info["episode_sharpe"] = float(np.mean(returns))/np.std(returns)*np.sqrt(252)
+            pnls = np.array(self.pnl_history)   # raw dollar PnL per step
+            pnl_std = float(np.std(pnls))
+
+            if pnl_std > 1e-8:
+                info["episode_sharpe"] = float(
+                    np.mean(pnls) / pnl_std * np.sqrt(252)
+                )
             else:
                 info["episode_sharpe"] = 0.0
-            info["total_pnl"] = float(np.sum(returns))
+
+            info["total_pnl"] = float(np.sum(pnls))   # actual cumulative PnL
             info["max_drawdown"] = float(self._compute_max_drawdown())
 
         return info
@@ -296,7 +302,6 @@ class OptionsHedgingEnv(gym.Env):
         """Compute maximum drawdown from PnL history."""
         if len(self.pnl_history) < 2:
             return 0.0
-
         cumulative = np.cumsum(self.pnl_history)
         running_max = np.maximum.accumulate(cumulative)
         drawdowns = running_max - cumulative
@@ -309,7 +314,7 @@ class OptionsHedgingEnv(gym.Env):
         T_rem = max(self.T - self.current_step * self.dt, 0)
         print(f"Step {self.current_step:3d} | "
               f"S={self.price:8.2f} | "
-              f"σ={self.current_vol:.4f} | "
+              f"sigma={self.current_vol:.4f} | "
               f"Hedge={self.hedge_position:+.4f} | "
               f"PV={self.portfolio_value:8.4f} | "
               f"T_rem={T_rem:.4f}y")

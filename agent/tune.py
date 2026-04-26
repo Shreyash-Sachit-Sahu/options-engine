@@ -2,9 +2,8 @@
 Hyperparameter Tuning — Optuna + SAC
 
 Automated search over SAC hyperparameters using Bayesian optimisation
-(TPE sampler). Each trial trains for a short budget (50k steps) and
-reports mean Sharpe as the objective. Bad trials are pruned early via
-MedianPruner to avoid wasting time.
+(TPE sampler). Each trial trains for a short budget and reports mean
+Sharpe as the objective. Bad trials are pruned early via MedianPruner.
 
 Results are persisted to SQLite so you can resume interrupted studies,
 inspect with optuna-dashboard, and re-run best params directly.
@@ -14,7 +13,7 @@ Usage
 # Basic run (50 trials, GBM)
 python agent/tune.py
 
-# Heston simulator, more trials, parallel
+# Heston simulator, more trials
 python agent/tune.py --simulator heston --n-trials 100
 
 # Resume a previous study
@@ -33,6 +32,7 @@ import argparse
 import warnings
 import numpy as np
 from pathlib import Path
+from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -45,13 +45,40 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from environment.options_env import OptionsHedgingEnv
 
-
-# ── Suppress noisy SB3 output during tuning ──────────────────────────────────
 warnings.filterwarnings("ignore")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intermediate reporting callback (enables Optuna pruning)
+# Tuning-safe environment
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TuningEnv(OptionsHedgingEnv):
+    """
+    Thin wrapper that disables early termination during tuning.
+
+    Without this, an untrained model at the start of a trial crashes
+    the portfolio in 1 step → episode_sharpe / total_pnl never set
+    in info → evaluate_trial sees empty pnls list → returns -999.0.
+
+    During tuning we want full 30-step episodes always so the proxy
+    Sharpe signal is meaningful.
+    """
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+
+        # Allow natural expiry termination but disable catastrophic-loss
+        # early exit — untrained agents would always trigger this
+        if terminated and self.current_step < self.n_steps:
+            # Undo the early termination (keep going)
+            terminated = False
+            reward = max(reward, -2.0)  # still penalise but don't abort
+
+        return obs, reward, terminated, truncated, info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pruning callback
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PruningCallback(BaseCallback):
@@ -60,29 +87,28 @@ class PruningCallback(BaseCallback):
     If the trial is clearly worse than the median, Optuna prunes it early.
     """
 
-    def __init__(self, trial: optuna.Trial, report_freq: int = 5000):
+    def __init__(self, trial: optuna.Trial, report_freq: int = 5_000):
         super().__init__()
         self.trial = trial
         self.report_freq = report_freq
-        self.episode_pnls = []
-        self._last_report_step = 0
+        self._pnls = deque(maxlen=200)
+        self._last_report = 0
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        for info in infos:
+        for info in self.locals.get("infos", []):
+            # Collect total_pnl at episode end
             if "total_pnl" in info and "episode" in info:
-                self.episode_pnls.append(info["total_pnl"])
+                self._pnls.append(info["total_pnl"])
 
-        if (self.num_timesteps - self._last_report_step >= self.report_freq
-                and len(self.episode_pnls) >= 10):
+        if (self.num_timesteps - self._last_report >= self.report_freq
+                and len(self._pnls) >= 10):
 
-            recent = np.array(self.episode_pnls[-50:])
-            sharpe = float(
-                np.mean(recent) / (np.std(recent) + 1e-10) * np.sqrt(252)
-            )
+            arr = np.array(self._pnls)
+            std = np.std(arr)
+            sharpe = float(np.mean(arr) / (std + 1e-10) * np.sqrt(252))
 
             self.trial.report(sharpe, step=self.num_timesteps)
-            self._last_report_step = self.num_timesteps
+            self._last_report = self.num_timesteps
 
             if self.trial.should_prune():
                 raise optuna.TrialPruned()
@@ -94,9 +120,14 @@ class PruningCallback(BaseCallback):
 # Environment factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_env(env_config: dict, seed: int = 0):
+def make_env(env_config: dict, seed: int = 0, tuning: bool = False):
+    """
+    Factory for creating environments.
+    Uses TuningEnv (no early termination) when tuning=True.
+    """
     def _init():
-        return OptionsHedgingEnv(**env_config, seed=seed)
+        cls = TuningEnv if tuning else OptionsHedgingEnv
+        return cls(**env_config, seed=seed)
     return _init
 
 
@@ -108,48 +139,45 @@ def evaluate_trial(model: SAC, train_env: VecNormalize,
                    env_config: dict, n_episodes: int = 40) -> float:
     """
     Run deterministic episodes and return mean Sharpe.
-
-    Syncs VecNormalize obs_rms from training env so observations
-    are on the same scale as what the model was trained on.
+    Uses TuningEnv so every episode runs the full 30 steps.
+    Syncs VecNormalize obs_rms from training env.
     """
-    eval_env = DummyVecEnv([make_env(env_config, seed=99999)])
+    eval_env = DummyVecEnv(
+        [make_env(env_config, seed=90000 + i, tuning=True)
+         for i in range(1)]
+    )
     eval_env = VecNormalize(
         eval_env, norm_obs=True, norm_reward=False,
         clip_obs=10.0, training=False
     )
-    # ── Critical: sync normalisation stats ───────────────────────────────
+    # Sync normalisation stats — critical for fair comparison across trials
     eval_env.obs_rms = train_env.obs_rms
     eval_env.ret_rms = train_env.ret_rms
 
     pnls = []
     for ep in range(n_episodes):
+        # VecNormalize doesn't accept seed in reset() — set it separately
+        eval_env.seed(90000 + ep)
         obs = eval_env.reset()
         done = False
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, _, done_arr, infos = eval_env.step(action)
             done = done_arr[0]
+
         if "total_pnl" in infos[0]:
             pnls.append(infos[0]["total_pnl"])
 
     eval_env.close()
 
     if len(pnls) < 5:
-        return -999.0  # degenerate trial
+        # Still got < 5 episodes with data — something is wrong; return bad score
+        print(f"   [WARN] Only {len(pnls)} episodes returned total_pnl")
+        return -50.0    # bad but not -999, so pruner can compare
 
-    pnls = np.array(pnls)
-    std = np.std(pnls)
-
-    if std < 1e-5:
-        return -999.0  # reject degenerate policies
-
-    sharpe = np.mean(pnls) / std * np.sqrt(252)
-    if abs(sharpe) > 5:
-        return -999.0
-    print("mean:", np.mean(pnls), "std:", std, "sharpe:", sharpe)
-
-    # Clip to avoid explosion
-    return float(np.clip(sharpe, -10, 10))
+    arr = np.array(pnls)
+    std = np.std(arr)
+    return float(np.mean(arr) / (std + 1e-10) * np.sqrt(252))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,36 +185,30 @@ def evaluate_trial(model: SAC, train_env: VecNormalize,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_objective(base_env_config: dict, n_train_steps: int, n_eval_episodes: int):
-    """
-    Returns the objective function closed over env config and budgets.
-    Separated so the same objective can be used with n_jobs > 1.
-    """
 
     def objective(trial: optuna.Trial) -> float:
 
         # ── Search space ─────────────────────────────────────────────────
-        lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
-        buffer_size = trial.suggest_categorical(
-            "buffer_size", [50_000, 100_000, 200_000]
-        )
-        tau = trial.suggest_float("tau", 0.001, 0.02, log=True)
-        gamma = trial.suggest_float("gamma", 0.95, 0.9999)
-        net_width = trial.suggest_categorical("net_width", [64, 128, 256])
-        net_depth = trial.suggest_int("net_depth", 1, 3)
-        ent_coef = trial.suggest_categorical(
-            "ent_coef", ["auto", 0.01, 0.05, 0.1, 0.5]
-        )
-        learning_starts = trial.suggest_categorical(
-            "learning_starts", [500, 1000, 2000]
-        )
+        lr            = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+        batch_size    = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
+        buffer_size   = trial.suggest_categorical("buffer_size",
+                                                   [50_000, 100_000, 200_000])
+        tau           = trial.suggest_float("tau", 0.001, 0.02, log=True)
+        gamma         = trial.suggest_float("gamma", 0.95, 0.9999)
+        net_width     = trial.suggest_categorical("net_width", [64, 128, 256])
+        net_depth     = trial.suggest_int("net_depth", 1, 3)
+        ent_coef      = trial.suggest_categorical("ent_coef",
+                                                   ["auto", 0.01, 0.05, 0.1, 0.5])
+        learning_starts = trial.suggest_categorical("learning_starts",
+                                                     [500, 1000, 2000])
 
         arch = [net_width] * net_depth
         policy_kwargs = dict(net_arch=dict(pi=arch, qf=arch))
 
-        # ── Environments ─────────────────────────────────────────────────
-        # 2 parallel envs keeps trial wall-time reasonable
-        train_env = DummyVecEnv([make_env(base_env_config, seed=i) for i in range(2)])
+        # ── Training envs (TuningEnv — no early termination) ─────────────
+        train_env = DummyVecEnv(
+            [make_env(base_env_config, seed=i, tuning=True) for i in range(2)]
+        )
         train_env = VecNormalize(
             train_env, norm_obs=True, norm_reward=True,
             clip_obs=10.0, clip_reward=10.0, gamma=gamma
@@ -207,12 +229,12 @@ def make_objective(base_env_config: dict, n_train_steps: int, n_eval_episodes: i
             gradient_steps=1,
             policy_kwargs=policy_kwargs,
             verbose=0,
-            seed=trial.number,  # different seed per trial
+            seed=trial.number,
         )
 
         # ── Train with pruning callback ───────────────────────────────────
         pruning_cb = PruningCallback(
-            trial, report_freq=max(n_train_steps // 20, 1000)
+            trial, report_freq=max(n_train_steps // 20, 2_000)
         )
 
         try:
@@ -245,7 +267,6 @@ def run_tuning(args):
     print("  SAC Hyperparameter Tuning — Optuna (TPE + MedianPruner)")
     print("=" * 70)
 
-    # ── Base environment config (mirrors train.py exactly) ────────────────
     base_env_config = {
         "simulator_type": args.simulator,
         "S0": 100.0,
@@ -262,36 +283,35 @@ def run_tuning(args):
             "kappa": 2.0, "theta": 0.04, "xi": 0.3, "rho": -0.7
         })
 
-    # ── Storage ───────────────────────────────────────────────────────────
     tuning_dir = Path(args.tuning_dir)
     tuning_dir.mkdir(parents=True, exist_ok=True)
     db_path = tuning_dir / "study.db"
     storage = f"sqlite:///{db_path}"
-
     study_name = args.study_name or f"sac_hedger_{args.simulator}"
 
     print(f"\n[CONFIG]")
-    print(f"  Simulator  : {args.simulator.upper()}")
-    print(f"  Trials     : {args.n_trials}")
-    print(f"  Steps/trial: {args.n_steps_per_trial:,}  (proxy budget)")
-    print(f"  Eval eps   : {args.n_eval_episodes}")
-    print(f"  Study name : {study_name}")
-    print(f"  Storage    : {db_path}")
+    print(f"  Simulator       : {args.simulator.upper()}")
+    print(f"  Trials          : {args.n_trials}")
+    print(f"  Steps/trial     : {args.n_steps_per_trial:,}  "
+          f"(recommended >= 100,000)")
+    print(f"  Eval episodes   : {args.n_eval_episodes}")
+    print(f"  Early term      : DISABLED during tuning (TuningEnv)")
+    print(f"  Study name      : {study_name}")
+    print(f"  Storage         : {db_path}")
 
-    # ── Create / resume study ────────────────────────────────────────────
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
-        direction="maximize",          # maximise Sharpe ratio
-        load_if_exists=True,           # resume if study already exists
+        direction="maximize",
+        load_if_exists=True,
         sampler=TPESampler(
             seed=42,
-            n_startup_trials=10,       # random exploration before TPE kicks in
-            multivariate=True,         # model param correlations
+            n_startup_trials=10,
+            multivariate=True,
         ),
         pruner=MedianPruner(
-            n_startup_trials=5,        # don't prune until 5 trials complete
-            n_warmup_steps=10,         # don't prune in first 10 reports
+            n_startup_trials=5,
+            n_warmup_steps=10,
             interval_steps=1,
         ),
     )
@@ -300,7 +320,6 @@ def run_tuning(args):
     if n_existing:
         print(f"\n[RESUME] Found {n_existing} existing trials. Continuing...")
 
-    # ── Run optimisation ─────────────────────────────────────────────────
     objective = make_objective(
         base_env_config,
         n_train_steps=args.n_steps_per_trial,
@@ -312,10 +331,10 @@ def run_tuning(args):
     study.optimize(
         objective,
         n_trials=args.n_trials,
-        n_jobs=args.n_jobs,           # set > 1 only with SubprocVecEnv or if your env is thread-safe
+        n_jobs=args.n_jobs,
         show_progress_bar=True,
-        gc_after_trial=True,          # free memory between trials
-        catch=(Exception,),           # log crashes without stopping the study
+        gc_after_trial=True,
+        catch=(Exception,),
     )
 
     # ── Results ───────────────────────────────────────────────────────────
@@ -342,7 +361,7 @@ def run_tuning(args):
     for k, v in best.params.items():
         print(f"    {k:<20} {v}")
 
-    # ── Top-5 table ───────────────────────────────────────────────────────
+    # Top-5
     print(f"\n  Top 5 trials:")
     print(f"  {'#':<5} {'Sharpe':>8}  {'lr':>10}  {'batch':>6}  "
           f"{'buf':>8}  {'arch':>10}  {'gamma':>8}  {'ent_coef':>10}")
@@ -355,12 +374,10 @@ def run_tuning(args):
               f"{p['batch_size']:>6}  {p['buffer_size']:>8,}  "
               f"{arch_str:>10}  {p['gamma']:>8.4f}  {str(p['ent_coef']):>10}")
 
-    # ── CLI snippet to retrain ────────────────────────────────────────────
+    # Retrain command
     bp = best.params
     arch = [bp['net_width']] * bp['net_depth']
-    ent  = bp['ent_coef']
-
-    print(f"\n  ─── Retrain command ─────────────────────────────────────────")
+    print(f"\n  ─── Retrain command ──────────────────────────────────────────")
     print(f"  python agent/train.py \\")
     print(f"    --simulator {args.simulator} \\")
     print(f"    --lr {bp['lr']:.2e} \\")
@@ -368,12 +385,12 @@ def run_tuning(args):
     print(f"    --buffer-size {bp['buffer_size']} \\")
     print(f"    --tau {bp['tau']:.4f} \\")
     print(f"    --gamma {bp['gamma']:.6f} \\")
-    print(f"    --ent-coef {ent} \\")
+    print(f"    --ent-coef {bp['ent_coef']} \\")
     print(f"    --learning-starts {bp['learning_starts']} \\")
     print(f"    --total-timesteps 500000")
     print(f"  # Network: pi={arch}, qf={arch}  (edit train.py policy_kwargs)")
 
-    # ── Save best params as JSON ──────────────────────────────────────────
+    # Save JSON
     import json
     results_path = tuning_dir / f"best_params_{study_name}.json"
     with open(results_path, "w") as f:
@@ -386,7 +403,6 @@ def run_tuning(args):
         }, f, indent=2)
     print(f"\n  Best params saved to: {results_path}")
 
-    # ── Optionally kick off full training immediately ─────────────────────
     if args.train_after:
         print(f"\n[AUTO-TRAIN] Launching full train with best params...")
         _launch_full_train(args, best.params)
@@ -396,19 +412,13 @@ def run_tuning(args):
 
 
 def _launch_full_train(args, params):
-    """
-    Kick off train.py programmatically with best params.
-    Modifies policy_kwargs in-place before calling train().
-    """
     import importlib.util, types
 
-    # Dynamically load train.py
     train_path = Path(__file__).parent / "train.py"
     spec = importlib.util.spec_from_file_location("train_module", train_path)
     train_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(train_module)
 
-    # Build args namespace
     train_args = types.SimpleNamespace(
         total_timesteps=500_000,
         simulator=args.simulator,
@@ -423,9 +433,9 @@ def _launch_full_train(args, params):
         seed=42,
         model_dir="agent/models",
         log_dir="tb_logs",
+        lr_cycle_steps=100_000,
     )
 
-    # Monkey-patch policy_kwargs with tuned arch
     arch = [params["net_width"]] * params["net_depth"]
     _orig_sac = train_module.SAC
 
@@ -446,39 +456,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Hyperparameter tuning for SAC hedging agent (Optuna)"
     )
+    parser.add_argument("--simulator", type=str, default="gbm",
+                        choices=["gbm", "heston"])
+    parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument(
-        "--simulator", type=str, default="gbm",
-        choices=["gbm", "heston"],
-        help="Market simulator type"
+        "--n-steps-per-trial", type=int, default=150_000,
+        help="Training steps per trial. "
+             "Must be >> learning_starts (min 2000). "
+             "Recommended: 100k-150k for reliable Sharpe signal."
     )
-    parser.add_argument(
-        "--n-trials", type=int, default=50,
-        help="Number of Optuna trials to run"
-    )
-    parser.add_argument(
-        "--n-steps-per-trial", type=int, default=50_000,
-        help="Training steps per trial (proxy budget; shorter = faster but noisier)"
-    )
-    parser.add_argument(
-        "--n-eval-episodes", type=int, default=40,
-        help="Episodes for final evaluation of each trial"
-    )
-    parser.add_argument(
-        "--n-jobs", type=int, default=1,
-        help="Parallel trials (1 = sequential; >1 requires thread-safe envs)"
-    )
-    parser.add_argument(
-        "--study-name", type=str, default=None,
-        help="Study name for resuming (default: sac_hedger_<simulator>)"
-    )
-    parser.add_argument(
-        "--tuning-dir", type=str, default="agent/tuning",
-        help="Directory for SQLite DB and result JSON"
-    )
-    parser.add_argument(
-        "--train-after", action="store_true",
-        help="Auto-launch full 500k-step training with best params after tuning"
-    )
+    parser.add_argument("--n-eval-episodes", type=int, default=40)
+    parser.add_argument("--n-jobs", type=int, default=1)
+    parser.add_argument("--study-name", type=str, default=None)
+    parser.add_argument("--tuning-dir", type=str, default="agent/tuning")
+    parser.add_argument("--train-after", action="store_true")
 
     args = parser.parse_args()
+
+    # Warn if trial budget is too low
+    if args.n_steps_per_trial < 50_000:
+        print(f"\n[WARN] --n-steps-per-trial={args.n_steps_per_trial:,} is very low.")
+        print(f"       Untrained models will produce garbage Sharpe values.")
+        print(f"       Recommended minimum: 100,000\n")
+
     run_tuning(args)
