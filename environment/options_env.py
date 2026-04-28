@@ -169,9 +169,10 @@ class OptionsHedgingEnv(gym.Env):
         except Exception:
             delta = 0.5
 
-        # ── 2. Target hedge: delta + small RL correction ──────────────────
-        rl_adjustment = float(action[0])
-        target_hedge = float(np.clip(delta + 0.3 * rl_adjustment, -1.0, 1.0))
+        # ── 2. Target hedge: agent directly sets hedge ratio ────────────
+        # Using delta + adjustment constrained the agent to replicate
+        # DeltaHedger. Raw action gives it freedom to find better strategies.
+        target_hedge = float(np.clip(action[0], -1.0, 1.0))
 
         # ── 3. Transaction cost ───────────────────────────────────────────
         position_change = abs(target_hedge - self.hedge_position)
@@ -202,21 +203,17 @@ class OptionsHedgingEnv(gym.Env):
         self.pnl_history.append(total_pnl)
 
         # ── 6. Reward ──────────────────────────────────────────────────────
-        # Re-compute delta at new state for hedge error signal
-        try:
-            g_new = greeks_call(self.price, self.K, T_remaining,
-                                self.r, self.current_vol)
-            delta_new = g_new.delta
-        except Exception:
-            delta_new = 0.5
-
-        hedge_error = abs(delta_new - self.hedge_position)
-
-        reward  = -0.1 * (total_pnl ** 2)                          # variance penalty
-        reward += 0.02 * total_pnl                                  # PnL incentive
-        reward -= tc                                                 # transaction cost
-        reward -= 0.5 * hedge_error                                 # hedge accuracy
-        reward -= 0.01 * abs(self.hedge_position - old_hedge)       # smooth trading
+        # Reward: directly target the hedging objective.
+        # - Penalise variance (squared PnL) — core signal
+        # - Small positive PnL incentive to break symmetry
+        # - Penalise transaction costs
+        # - Penalise large position jumps (smooth trading)
+        # NOTE: hedge_error term removed — it was pushing the agent to
+        # replicate DeltaHedger rather than outperform it.
+        reward  = -0.5 * (total_pnl ** 2)     # variance penalty (primary)
+        reward += 0.1  * total_pnl             # PnL incentive
+        reward -= tc                           # transaction cost
+        reward -= 0.05 * abs(self.hedge_position - old_hedge)  # smooth trading
 
         # ── 7. Termination ────────────────────────────────────────────────
         terminated = False

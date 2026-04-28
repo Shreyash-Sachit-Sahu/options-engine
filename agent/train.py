@@ -122,7 +122,7 @@ class DynamicHPController(BaseCallback):
         self.ent_coef_auto = ent_coef_auto
         self.sharpe_patience = sharpe_patience
         self._ent_coef_current = 0.1
-        self._ent_coef_min = 0.001
+        self._ent_coef_min = 0.02   # floor raised: 0.001 killed exploration
         self._ent_coef_max = 0.8
         self._ent_boost_factor = 1.5
         self._ent_decay_factor = 0.85
@@ -367,7 +367,7 @@ def train(args):
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── Model ────────────────────────────────────────────────────────────
-    policy_kwargs = dict(net_arch=dict(pi=[256], qf=[256]))
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
     ent_coef_auto = (args.ent_coef == "auto")
 
     model = SAC(
