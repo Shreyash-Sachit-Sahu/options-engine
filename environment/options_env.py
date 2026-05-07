@@ -203,17 +203,11 @@ class OptionsHedgingEnv(gym.Env):
         self.pnl_history.append(total_pnl)
 
         # ── 6. Reward ──────────────────────────────────────────────────────
-        # Reward: directly target the hedging objective.
-        # - Penalise variance (squared PnL) — core signal
-        # - Small positive PnL incentive to break symmetry
-        # - Penalise transaction costs
-        # - Penalise large position jumps (smooth trading)
-        # NOTE: hedge_error term removed — it was pushing the agent to
-        # replicate DeltaHedger rather than outperform it.
-        reward  = -0.5 * (total_pnl ** 2)     # variance penalty (primary)
-        reward += 0.1  * total_pnl             # PnL incentive
+        # Reward: minimise hedging variance + transaction costs.
+        # Kept simple and stable — complex reward shaping caused the agent
+        # to exploit the reward rather than learn genuine hedging.
+        reward  = -0.1 * (total_pnl ** 2)     # variance penalty
         reward -= tc                           # transaction cost
-        reward -= 0.05 * abs(self.hedge_position - old_hedge)  # smooth trading
 
         # ── 7. Termination ────────────────────────────────────────────────
         terminated = False
@@ -322,3 +316,5 @@ class OptionsHedgingEnv(gym.Env):
               f"Hedge={self.hedge_position:+.4f} | "
               f"PV={self.portfolio_value:8.4f} | "
               f"T_rem={T_rem:.4f}y")
+
+              

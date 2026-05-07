@@ -29,6 +29,9 @@ from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from agent.gpu_utils import get_device, device_banner, patch_sb3_device, \
+    recommended_batch_size, recommended_buffer_size
+
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
@@ -323,6 +326,19 @@ def train(args):
     print("  SAC Agent Training — Dynamic HP Control")
     print("=" * 70)
 
+    # ─── Device setup ─────────────────────────────────────────────────────
+    device = get_device(prefer=args.device)
+    patch_sb3_device(device)
+
+    # Auto-scale batch/buffer sizes for GPU if user didn't override defaults
+    if device != "cpu":
+        if args.batch_size == 256:          # still at the CLI default
+            args.batch_size = recommended_batch_size(device, base=args.batch_size)
+            print(f"[GPU] Auto batch_size  → {args.batch_size}")
+        if args.buffer_size == 200_000:     # still at the CLI default
+            args.buffer_size = recommended_buffer_size(device, base=args.buffer_size)
+            print(f"[GPU] Auto buffer_size → {args.buffer_size:,}")
+
     # ─── Environment config ───────────────────────────────────────────────
     env_config = {
         "simulator_type": args.simulator,
@@ -385,10 +401,12 @@ def train(args):
         gradient_steps=1,           # DHP adjusts this dynamically
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(log_dir),
+        device=device,              # ← GPU/MPS/CPU routing
         seed=args.seed,
     )
 
     print(f"\n[SAC] Initial configuration:")
+    print(f"   device         : {device}")
     print(f"   lr             : {args.lr}")
     print(f"   buffer_size    : {args.buffer_size:,}")
     print(f"   batch_size     : {args.batch_size}")
@@ -522,6 +540,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train SAC hedging agent with dynamic HP control"
     )
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cuda", "mps", "cpu"],
+                        help="Compute device: auto (default), cuda, mps, or cpu")
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--simulator", type=str, default="gbm",
                         choices=["gbm", "heston"])

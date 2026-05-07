@@ -27,8 +27,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.pricer.pricer_py import bs_call, bs_put, greeks_call, greeks_put, mc_price
 from backtester.vol_surface import build_synthetic_surface, build_vol_surface
+from agent.gpu_utils import get_device
 
-# Try importing C++ pricer
+# ── C++ pricer (Python fallback if not compiled) ──────────────────────────────
 try:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     import pricer as cpp_pricer
@@ -36,6 +37,34 @@ try:
 except ImportError:
     from src.pricer import pricer_py as cpp_pricer
     BACKEND = "Python"
+
+# ── GPU detection (display only — training runs separately via train.py) ──────
+try:
+    import torch
+    GPU_DEVICE    = get_device(verbose=False)
+    GPU_AVAILABLE = GPU_DEVICE != "cpu"
+    if GPU_AVAILABLE and GPU_DEVICE.startswith("cuda"):
+        _idx       = torch.cuda.current_device()
+        GPU_NAME   = torch.cuda.get_device_name(_idx)
+        GPU_MEM_GB = torch.cuda.get_device_properties(_idx).total_memory / 1024 ** 3
+        GPU_LABEL  = f"{GPU_NAME} · {GPU_MEM_GB:.0f} GB"
+        GPU_COLOR  = "#10b981"
+    elif GPU_AVAILABLE and GPU_DEVICE == "mps":
+        GPU_NAME   = "Apple MPS"
+        GPU_LABEL  = "Apple Silicon (MPS)"
+        GPU_COLOR  = "#10b981"
+    else:
+        GPU_NAME   = "CPU"
+        GPU_LABEL  = "No GPU — using CPU"
+        GPU_COLOR  = "#f59e0b"
+except Exception:
+    GPU_AVAILABLE = False
+    GPU_DEVICE    = "cpu"
+    GPU_LABEL     = "PyTorch not installed"
+    GPU_COLOR     = "#f43f5e"
+
+# ── API mode (off by default — dashboard uses direct imports, not the API) ────
+API_DEFAULT_URL = "http://localhost:8000"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +342,14 @@ st.markdown(f"""
         <div class="header-title">⚡ Options Pricing Engine</div>
         <div class="header-subtitle">Multi-Agent Hedging · C++ Core · Reinforcement Learning</div>
     </div>
-    <div class="backend-badge">{BACKEND} Backend</div>
+    <div style="display:flex; gap:8px; align-items:center;">
+        <div class="backend-badge">{BACKEND} Backend</div>
+        <div style="background:{GPU_COLOR}22; color:{GPU_COLOR}; font-size:0.7rem; font-weight:700;
+                    padding:4px 12px; border-radius:20px; letter-spacing:1px;
+                    text-transform:uppercase; border:1px solid {GPU_COLOR}44;">
+            {"⚡ " + GPU_DEVICE.upper() if GPU_AVAILABLE else "⚪ CPU"}
+        </div>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -392,6 +428,49 @@ with st.sidebar:
                      border: 1px solid {m_color}44;">
             {m_text} · Moneyness: {moneyness:.3f}
         </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── GPU Status Panel ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### ⚡ Compute")
+    gpu_icon = "🟢" if GPU_AVAILABLE else "🟡"
+    st.markdown(f"""
+    <div style="background:rgba(16,185,129,0.08); border:1px solid {GPU_COLOR}44;
+                border-radius:10px; padding:12px 14px; margin:4px 0;">
+        <div style="font-size:0.75rem; color:#94a3b8; text-transform:uppercase;
+                    letter-spacing:1px; margin-bottom:4px;">Training Device</div>
+        <div style="font-size:0.9rem; font-weight:700; color:{GPU_COLOR};">
+            {gpu_icon} {GPU_LABEL}
+        </div>
+        <div style="font-size:0.72rem; color:#64748b; margin-top:6px;">
+            Dashboard uses direct Python imports.<br>
+            GPU is used by <code>train.py</code> / <code>tune.py</code>.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── API Info Panel ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🔌 FastAPI Server")
+    st.markdown(f"""
+    <div style="background:rgba(99,102,241,0.06); border:1px solid rgba(99,102,241,0.2);
+                border-radius:10px; padding:12px 14px; margin:4px 0;">
+        <div style="font-size:0.8rem; color:#94a3b8; line-height:1.5;">
+            The dashboard does <strong style="color:#f1f5f9;">not</strong> need the
+            FastAPI server — all pricing and agent calls go through direct Python imports.<br><br>
+            Start the API only if you need <strong style="color:#f1f5f9;">external HTTP access</strong>:
+        </div>
+        <div style="background:#0a0e17; border-radius:6px; padding:8px 10px; margin-top:8px;
+                    font-family:monospace; font-size:0.75rem; color:#a8d8ea;">
+            uvicorn api.main:app --port 8000
+        </div>
+        <div style="margin-top:8px;">
+            <a href="{API_DEFAULT_URL}/docs" target="_blank"
+               style="color:#6366f1; font-size:0.75rem; text-decoration:none;">
+                📖 Swagger UI → localhost:8000/docs
+            </a>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 

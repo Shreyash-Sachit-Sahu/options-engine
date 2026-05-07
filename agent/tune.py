@@ -44,6 +44,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 
 from environment.options_env import OptionsHedgingEnv
+from agent.gpu_utils import get_device, patch_sb3_device, device_banner
 
 warnings.filterwarnings("ignore")
 
@@ -184,7 +185,8 @@ def evaluate_trial(model: SAC, train_env: VecNormalize,
 # Optuna objective
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_objective(base_env_config: dict, n_train_steps: int, n_eval_episodes: int):
+def make_objective(base_env_config: dict, n_train_steps: int,
+                   n_eval_episodes: int, device: str):
 
     def objective(trial: optuna.Trial) -> float:
 
@@ -228,6 +230,7 @@ def make_objective(base_env_config: dict, n_train_steps: int, n_eval_episodes: i
             train_freq=(1, "step"),
             gradient_steps=1,
             policy_kwargs=policy_kwargs,
+            device=device,              # ← GPU/MPS/CPU routing
             verbose=0,
             seed=trial.number,
         )
@@ -267,6 +270,10 @@ def run_tuning(args):
     print("  SAC Hyperparameter Tuning — Optuna (TPE + MedianPruner)")
     print("=" * 70)
 
+    # ─── Device setup ─────────────────────────────────────────────────────
+    device = get_device(prefer=args.device)
+    patch_sb3_device(device)
+
     base_env_config = {
         "simulator_type": args.simulator,
         "S0": 100.0,
@@ -290,6 +297,7 @@ def run_tuning(args):
     study_name = args.study_name or f"sac_hedger_{args.simulator}"
 
     print(f"\n[CONFIG]")
+    print(f"  Device          : {device}")
     print(f"  Simulator       : {args.simulator.upper()}")
     print(f"  Trials          : {args.n_trials}")
     print(f"  Steps/trial     : {args.n_steps_per_trial:,}  "
@@ -324,6 +332,7 @@ def run_tuning(args):
         base_env_config,
         n_train_steps=args.n_steps_per_trial,
         n_eval_episodes=args.n_eval_episodes,
+        device=device,
     )
 
     print(f"\n[START] Running {args.n_trials} trials...\n")
@@ -379,6 +388,7 @@ def run_tuning(args):
     arch = [bp['net_width']] * bp['net_depth']
     print(f"\n  ─── Retrain command ──────────────────────────────────────────")
     print(f"  python agent/train.py \\")
+    print(f"    --device {device} \\")
     print(f"    --simulator {args.simulator} \\")
     print(f"    --lr {bp['lr']:.2e} \\")
     print(f"    --batch-size {bp['batch_size']} \\")
@@ -405,13 +415,13 @@ def run_tuning(args):
 
     if args.train_after:
         print(f"\n[AUTO-TRAIN] Launching full train with best params...")
-        _launch_full_train(args, best.params)
+        _launch_full_train(args, best.params, device)
 
     print("\n" + "=" * 70)
     return study
 
 
-def _launch_full_train(args, params):
+def _launch_full_train(args, params, device: str):
     import importlib.util, types
 
     train_path = Path(__file__).parent / "train.py"
@@ -420,6 +430,7 @@ def _launch_full_train(args, params):
     spec.loader.exec_module(train_module)
 
     train_args = types.SimpleNamespace(
+        device=device,
         total_timesteps=500_000,
         simulator=args.simulator,
         lr=params["lr"],
@@ -456,6 +467,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Hyperparameter tuning for SAC hedging agent (Optuna)"
     )
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cuda", "mps", "cpu"],
+                        help="Compute device: auto (default), cuda, mps, or cpu")
     parser.add_argument("--simulator", type=str, default="gbm",
                         choices=["gbm", "heston"])
     parser.add_argument("--n-trials", type=int, default=50)

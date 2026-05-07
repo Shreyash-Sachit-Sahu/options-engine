@@ -16,6 +16,8 @@ from typing import Dict, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from agent.gpu_utils import get_device, device_banner
+
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -158,6 +160,8 @@ def run_full_evaluation(args):
         print(f"   Evaluating {name}...")
         result = evaluate_agent(env, agent, n_episodes=n_episodes)
         result["agent"] = name
+        # Use mean_episode_sharpe (within-episode) to match SAC's metric
+        result["sharpe_ratio"] = result["mean_episode_sharpe"]
         results[name] = result
         print(f"   [OK] {name}: Sharpe={result['sharpe_ratio']:.4f}, "
               f"PnL={result['mean_pnl']:.4f}")
@@ -168,8 +172,9 @@ def run_full_evaluation(args):
 
     if os.path.exists(model_path + ".zip") or os.path.exists(model_path):
         print(f"\n[SAC] Evaluating SAC agent...")
+        device = get_device(verbose=True)
         actual_path = model_path if os.path.exists(model_path) else model_path
-        model = SAC.load(actual_path)
+        model = SAC.load(actual_path, device=device)   # ← load weights onto GPU
         sac_result = evaluate_sac(model, vnorm_path, env_config, n_episodes)
         results["SAC"] = sac_result
         print(f"   [OK] SAC: Sharpe={sac_result['sharpe_ratio']:.4f}, "
@@ -233,6 +238,9 @@ def run_full_evaluation(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate hedging agents")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cuda", "mps", "cpu"],
+                        help="Compute device for SAC inference (default: auto)")
     parser.add_argument("--simulator", type=str, default="gbm",
                         choices=["gbm", "heston"])
     parser.add_argument("--n-episodes", type=int, default=1000,
