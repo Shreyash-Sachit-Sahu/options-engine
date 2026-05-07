@@ -100,19 +100,40 @@ nvidia-smi dmon -s u
 
 > **Tested on:** NVIDIA GeForce RTX 3050 Laptop GPU · 4 GB VRAM · sm_86 · CUDA 12.8 / driver 595.97
 
-### 5. (Optional) Pre-tune Hyperparameters
+### 5. Pre-tune Hyperparameters (Recommended)
+
+Run Bayesian hyperparameter search **before** training to find the best configuration. This typically pushes Sharpe 0.05–0.15 higher than default settings and is worth the 2–3 hour compute cost.
+
 ```bash
-# Find best hyperparameters before training (Bayesian search, 50 trials)
+# GBM simulator — good starting point, faster trials
 python agent/tune.py --simulator gbm --n-trials 50
 
-# Tune then immediately train with best params
+# Heston simulator — more realistic vol dynamics, run more trials
+python agent/tune.py --simulator heston --n-trials 100
+
+# Tune then immediately train with best params (recommended)
 python agent/tune.py --simulator gbm --n-trials 50 --train-after
+
+# Monitor trials live in browser
+optuna-dashboard sqlite:///agent/tuning/study.db
 ```
 
+Results are saved to `agent/tuning/best_params_<study>.json`. A ready-to-paste `train.py` command is printed on completion.
+
 ### 6. Train the Agent
+
+Train on GBM first, then Heston for robustness. GPU is auto-detected.
+
 ```bash
-# GPU is auto-detected — no flag needed
+# GBM — standard log-normal price dynamics
 python agent/train.py --total-timesteps 500000 --simulator gbm
+
+# Heston — stochastic volatility, more realistic, harder to learn
+# Use faster LR cycles to help navigate the more complex landscape
+python agent/train.py --total-timesteps 500000 --simulator heston --lr-cycle-steps 50000
+
+# With pre-tuned params (copy the command printed by tune.py)
+python agent/train.py --lr 3.2e-4 --batch-size 256 --gamma 0.9971 ...
 
 # Force a specific device
 python agent/train.py --device cuda
@@ -120,25 +141,62 @@ python agent/train.py --device cpu
 
 # Enable dynamic entropy control
 python agent/train.py --ent-coef 0.1
-
-# With pre-tuned params (copy the command printed by tune.py)
-python agent/train.py --lr 3.2e-4 --batch-size 256 --gamma 0.9971 ...
 ```
+
+> **Why train on both simulators?** GBM assumes constant volatility — fast to train and a good baseline. Heston models volatility as a mean-reverting stochastic process, which is closer to real market behaviour. An agent trained only on GBM can be brittle when volatility clusters or spikes.
 
 ### 7. Evaluate
 ```bash
 python agent/evaluate.py --n-episodes 1000
 ```
 
-### 8. Launch Dashboard
+### 8. Historical Backtest Against Real SPY Data
+
+After training on simulated data, validate the agent on **real SPY price history**. This is the most credible test — it checks whether the agent generalises to actual market dynamics rather than just simulation artefacts.
+
+```bash
+python backtester/historical.py
+```
+
+The backtester fetches 6 months of SPY closing prices via yfinance, replays historical price paths through the option lifecycle, and compares the SAC agent against delta hedging on real data. Key metrics reported: PnL distribution, Sharpe ratio, max drawdown, and hedge ratio stability.
+
+```bash
+# Longer history for more robust statistics
+python -c "
+from backtester.historical import fetch_spy_data, HistoricalBacktester
+import numpy as np
+
+prices = fetch_spy_data(period='1y')['Close'].values
+bt = HistoricalBacktester(prices, K=prices[-1], T_days=30)
+# load your trained agent and run bt.run_episode(agent, start_idx=i)
+"
+```
+
+### 9. Launch Dashboard
 ```bash
 streamlit run dashboard/app.py
 ```
 
-### 9. Start API
+The dashboard connects directly to Python modules — **no API server needed**. Tick "Use live SPY data" on the Vol Surface panel to fetch a real IV surface from Yahoo Finance.
+
+### 10. Start API (Optional)
+
+The FastAPI server provides HTTP access to the pricer and agent for external tools. The Streamlit dashboard does **not** use it — they are independent.
+
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8000
+# Interactive docs: http://localhost:8000/docs
 ```
+
+## 📋 Recommended Full Workflow
+
+```
+tune.py          →   train.py (GBM)   →   train.py (Heston)   →   historical.py   →   evaluate.py
+find best HPs        500k steps            500k steps               real SPY data       final metrics
+~2–3 hrs             ~1–2 hrs              ~2–3 hrs                 ~5 min              1000 episodes
+```
+
+Each stage builds on the last. Skip stages if time is short — GBM training alone is sufficient for the baseline metrics.
 
 ## ⚡ GPU Acceleration
 
@@ -205,12 +263,12 @@ options-engine/
 │   ├── gpu_utils.py           # Device detection, cuDNN config, benchmarking
 │   └── models/                # Saved checkpoints + VecNormalize stats
 ├── backtester/
-│   ├── historical.py          # yfinance SPY replay environment
+│   ├── historical.py          # yfinance SPY replay — real market validation
 │   └── vol_surface.py         # IV surface construction (live + synthetic)
 ├── dashboard/
-│   └── app.py                 # Streamlit dashboard (6 panels)
+│   └── app.py                 # Streamlit dashboard (6 panels, direct imports)
 ├── api/
-│   └── main.py                # FastAPI backend
+│   └── main.py                # FastAPI backend (optional, external HTTP access)
 ├── tests/
 │   ├── test_pricer.py         # Put-call parity, Greeks bounds, benchmarks
 │   ├── test_environment.py    # Gym compliance, simulator tests, baselines
@@ -256,8 +314,6 @@ Parameters searched:
 | `tau` | `0.001 → 0.02` log | Target network update speed |
 | `buffer_size` | `50k, 100k, 200k` | Replay buffer capacity |
 | `learning_starts` | `500, 1000, 2000` | Exploration before first gradient |
-
-Results are saved to `agent/tuning/best_params_<study>.json` and a ready-to-paste `train.py` command is printed on completion.
 
 ---
 
@@ -312,20 +368,10 @@ python agent/train.py --ent-coef 0.1
 python agent/train.py --simulator heston --lr-cycle-steps 50000
 ```
 
----
-
-### Recommended Workflow
-
-```
-tune.py (50 trials)  →  train.py --train-after  →  evaluate.py
-   find best HPs           dynamic control              full metrics
-   ~2–3 hrs                during 500k steps            1000 episodes
-```
-
 ## 🧪 Testing
 
 ```bash
-# All tests
+# All tests (70 tests, ~13s)
 python -m pytest tests/ -v
 
 # With coverage
@@ -344,7 +390,8 @@ python -m pytest tests/test_pricer.py::TestBenchmark -v
 | GPU Acceleration | CUDA 12.8+, cuDNN (auto-detected via `agent/gpu_utils.py`) |
 | Pre-training Tuning | Optuna (TPE + MedianPruner) |
 | Dynamic HP Control | Custom SB3 callback (SGDR + Sharpe-driven) |
-| Market Simulation | NumPy, SciPy |
+| Market Simulation | NumPy, SciPy (GBM + Heston + Regime-switching) |
+| Historical Validation | yfinance SPY replay (`backtester/historical.py`) |
 | Dashboard | Streamlit, Plotly |
 | API | FastAPI, uvicorn |
 | Data | yfinance |
@@ -352,7 +399,13 @@ python -m pytest tests/test_pricer.py::TestBenchmark -v
 
 ## 📊 API Documentation
 
-Start the server and visit `http://localhost:8000/docs` for interactive Swagger UI.
+The FastAPI server is **optional** — the Streamlit dashboard works without it via direct Python imports. Start it only if you need external HTTP access to the pricer or agent.
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+Visit `http://localhost:8000/docs` for interactive Swagger UI.
 
 | Method | Path | Description |
 |--------|------|-------------|

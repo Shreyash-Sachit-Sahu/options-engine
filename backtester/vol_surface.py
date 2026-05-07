@@ -19,25 +19,55 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.pricer.pricer_py import implied_vol, bs_call
 
 
+def _market_is_open() -> bool:
+    """Return True if NYSE is currently in regular trading hours (ET)."""
+    try:
+        from datetime import timezone, timedelta
+        ET = timezone(timedelta(hours=-4))   # EDT (UTC-4); EST is UTC-5
+        now = datetime.now(ET)
+        if now.weekday() >= 5:               # Saturday / Sunday
+            return False
+        open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+        close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        return open_t <= now <= close_t
+    except Exception:
+        return False
+
+
 def build_vol_surface(spot: float, r: float = 0.05,
                       max_expiries: int = 8,
-                      min_volume: int = 10) -> pd.DataFrame:
+                      min_volume: int = 0) -> pd.DataFrame:
     """
     Build an implied volatility surface from live SPY options data.
 
     For each available expiry and strike, computes the implied
     volatility by inverting the BS formula using Brent's method.
 
+    Mid-price logic (in order of preference):
+        1. (bid + ask) / 2  — most reliable when market is open
+        2. lastPrice        — fallback when bid/ask are zero/NaN (closed market)
+
+    Volume filter:
+        NaN volume is treated as unknown (kept). Only rows with a known
+        volume strictly below min_volume are dropped. Set min_volume=0
+        to disable the filter entirely (recommended outside market hours).
+
     Args:
-        spot: Current spot price of SPY
-        r: Risk-free rate
+        spot:         Current spot price of SPY
+        r:            Risk-free rate
         max_expiries: Maximum number of expiry dates to include
-        min_volume: Minimum volume filter for reliable quotes
+        min_volume:   Minimum known volume to keep a row (0 = no filter)
 
     Returns:
-        DataFrame with columns: [strike, expiry, T, iv, moneyness, mid_price]
+        DataFrame with columns: [strike, expiry, T, iv, moneyness,
+                                  mid_price, volume, open_interest, spread_pct]
     """
     import yfinance as yf
+
+    if not _market_is_open():
+        print("[INFO] Market is currently closed — bid/ask quotes will be 0.")
+        print("       Using lastPrice as fallback. IV quality may be lower.")
+        print("       For best results run during NYSE hours (9:30–16:00 ET).")
 
     spy = yf.Ticker("SPY")
     expiries = spy.options
@@ -62,32 +92,61 @@ def build_vol_surface(spot: float, r: float = 0.05,
             if T <= 0:
                 continue
 
-            # Filter for liquid options
+            # ── Compute mid-price (bid/ask preferred, lastPrice fallback) ───
+            if "bid" in calls.columns and "ask" in calls.columns:
+                calls["_mid"] = (
+                    calls["bid"].fillna(0) + calls["ask"].fillna(0)
+                ) / 2
+                # Fall back to lastPrice where bid/ask are both zero/NaN
+                mask = calls["_mid"] <= 0.01
+                calls.loc[mask, "_mid"] = calls.loc[mask, "lastPrice"].fillna(0)
+            else:
+                calls["_mid"] = calls["lastPrice"].fillna(0)
+
+            # ── Volume filter: NaN volume is common — treat as unknown, keep ─
+            vol_ok = calls["volume"].isna() | (calls["volume"] >= min_volume)
+
             calls_filtered = calls[
-                (calls["volume"] >= min_volume) &
-                (calls["lastPrice"] > 0.01) &
-                (calls["strike"] > spot * 0.7) &
-                (calls["strike"] < spot * 1.3)
-            ]
+                vol_ok &
+                (calls["_mid"] > 0.05) &
+                (calls["strike"] > spot * 0.70) &
+                (calls["strike"] < spot * 1.30)
+            ].copy()
+
+            if calls_filtered.empty:
+                continue
 
             for _, row in calls_filtered.iterrows():
                 try:
-                    K = float(row["strike"])
-                    market_price = float(row["lastPrice"])
+                    K           = float(row["strike"])
+                    market_price = float(row["_mid"])
+
+                    # Use bid/ask spread as a liquidity proxy
+                    spread = 0.0
+                    if "bid" in row and "ask" in row:
+                        b = row["bid"] if pd.notna(row["bid"]) else 0
+                        a = row["ask"] if pd.notna(row["ask"]) else 0
+                        if a > 0:
+                            spread = (a - b) / a  # relative spread
+
+                    # Skip if spread is extremely wide (stale quote)
+                    if spread > 0.8:
+                        continue
 
                     # Compute implied vol via Brent's method
                     iv = implied_vol(market_price, spot, K, T, r, "call")
 
-                    if 0.01 < iv < 2.0:  # Sanity filter
+                    if 0.02 < iv < 3.0:  # Sanity filter
                         surface_data.append({
-                            "strike": K,
-                            "expiry": exp_str,
-                            "T": T,
-                            "iv": iv,
-                            "moneyness": K / spot,
-                            "mid_price": market_price,
-                            "volume": int(row.get("volume", 0)),
-                            "open_interest": int(row.get("openInterest", 0)),
+                            "strike":         K,
+                            "expiry":         exp_str,
+                            "T":              T,
+                            "iv":             iv,
+                            "moneyness":      K / spot,
+                            "mid_price":      market_price,
+                            "volume":         int(row["volume"]) if pd.notna(row.get("volume")) else 0,
+                            "open_interest":  int(row["openInterest"]) if pd.notna(row.get("openInterest")) else 0,
+                            "spread_pct":     round(spread, 4),
                         })
                 except Exception:
                     continue  # Skip if IV can't be computed
@@ -98,12 +157,23 @@ def build_vol_surface(spot: float, r: float = 0.05,
 
     if not surface_data:
         print("[WARN] No valid IV points computed. Using synthetic surface.")
+        print("       Common causes:")
+        print("         1. volume NaN + min_volume filter dropped all rows  (now fixed)")
+        print("         2. Market closed — lastPrice is stale, bid/ask = 0")
+        print("         3. IV solver failed for all strikes (check pricer)")
+        print("       Tip: run with min_volume=0 to bypass volume filter entirely.")
         return build_synthetic_surface(spot, r)
 
     df = pd.DataFrame(surface_data)
-    print(f"[OK] Built IV surface: {len(df)} points across "
+    live_pct = len(df) / max(sum(
+        len(spy.option_chain(e).calls) for e in expiries
+        if e in df["expiry"].values
+    ), 1) * 100
+
+    print(f"[OK] Built live IV surface: {len(df)} points across "
           f"{df['expiry'].nunique()} expiries, "
-          f"{df['strike'].nunique()} strikes")
+          f"{df['strike'].nunique()} strikes  "
+          f"(IV range: {df['iv'].min():.2f}–{df['iv'].max():.2f})")
 
     return df
 

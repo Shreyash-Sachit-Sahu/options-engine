@@ -29,6 +29,24 @@ from src.pricer.pricer_py import bs_call, bs_put, greeks_call, greeks_put, mc_pr
 from backtester.vol_surface import build_synthetic_surface, build_vol_surface
 from agent.gpu_utils import get_device
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_spy_spot() -> float:
+    """Fetch current SPY spot price. Cached 10 min."""
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("SPY").history(period="1d")
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        return 500.0
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_live_surface(spot: float) -> "pd.DataFrame":
+    """Fetch live IV surface. Cached 5 min per spot value."""
+    return build_vol_surface(spot)
+
+
+
 # ── C++ pricer (Python fallback if not compiled) ──────────────────────────────
 try:
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -534,13 +552,41 @@ with tab1:
 
     with col2:
         use_live = st.checkbox("Use live SPY data", value=False, key="live_data")
-        surface_spot = st.number_input("Spot", value=float(S), key="surface_spot")
+
+        if use_live:
+            # Auto-fetch real SPY spot — don't use the BS slider value
+            with st.spinner("Getting SPY spot..."):
+                spy_spot = _fetch_spy_spot()
+            surface_spot = st.number_input(
+                "SPY Spot (auto)", value=spy_spot,
+                key="surface_spot", disabled=True,
+                help="Auto-fetched from Yahoo Finance"
+            )
+            st.caption(f"SPY: ${spy_spot:.2f}")
+        else:
+            surface_spot = st.number_input(
+                "Spot", value=float(S), key="surface_spot",
+                help="Uses the spot price from the BS panel above"
+            )
+
+        if use_live:
+            if st.button("🔄 Refresh", key="refresh_surface",
+                         help="Force re-fetch from Yahoo Finance"):
+                st.cache_data.clear()
+            st.caption("⏱ Cached 5 min")
 
     # Build surface
     if use_live:
-        with st.spinner("Fetching live options data..."):
+        with st.spinner("Building live IV surface..."):
             try:
-                surface_df = build_vol_surface(surface_spot)
+                surface_df = _fetch_live_surface(round(surface_spot, 2))
+                n_pts = len(surface_df)
+                n_exp = surface_df["expiry"].nunique()
+                st.success(
+                    f"✅ Live surface: {n_pts} IV points · {n_exp} expiries · "
+                    f"IV {surface_df['iv'].min():.2f}–{surface_df['iv'].max():.2f}",
+                    icon=None
+                )
             except Exception as e:
                 st.warning(f"Live data unavailable: {e}. Using synthetic surface.")
                 surface_df = build_synthetic_surface(surface_spot)
