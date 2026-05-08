@@ -387,18 +387,7 @@ def run_tuning(args):
     bp = best.params
     arch = [bp['net_width']] * bp['net_depth']
     print(f"\n  ─── Retrain command ──────────────────────────────────────────")
-    print(f"  python agent/train.py \\")
-    print(f"    --device {device} \\")
-    print(f"    --simulator {args.simulator} \\")
-    print(f"    --lr {bp['lr']:.2e} \\")
-    print(f"    --batch-size {bp['batch_size']} \\")
-    print(f"    --buffer-size {bp['buffer_size']} \\")
-    print(f"    --tau {bp['tau']:.4f} \\")
-    print(f"    --gamma {bp['gamma']:.6f} \\")
-    print(f"    --ent-coef {bp['ent_coef']} \\")
-    print(f"    --learning-starts {bp['learning_starts']} \\")
-    print(f"    --total-timesteps 500000")
-    print(f"  # Network: pi={arch}, qf={arch}  (edit train.py policy_kwargs)")
+    print(f"  python agent/train.py --device {device} --simulator {args.simulator} --lr {bp['lr']:.2e} --batch-size {bp['batch_size']} --buffer-size {bp['buffer_size']} --tau {bp['tau']:.4f} --gamma {bp['gamma']:.6f} --ent-coef {bp['ent_coef']} --learning-starts {bp['learning_starts']} --total-timesteps 500000 (edit train.py policy_kwargs)")
 
     # Save JSON
     import json

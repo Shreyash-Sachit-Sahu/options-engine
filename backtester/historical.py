@@ -119,8 +119,9 @@ class HistoricalBacktester:
         S0 = self.prices[start_idx]
         T = self.T_days / 252
 
-        # Initial option premium
-        premium = bs_call(S0, self.K, T, self.r, self.sigma)
+        # Initial option premium — normalised to training-env scale (S0=100)
+        scale = 100.0 / S0
+        premium = bs_call(S0, self.K, T, self.r, self.sigma) * scale
         portfolio_value = premium
         hedge_position = 0.0
 
@@ -168,18 +169,24 @@ class HistoricalBacktester:
             except Exception:
                 vega, theta = 0.0, 0.0
 
+            # Normalise Greeks to training-env scale (trained on S0=100).
+            # vega, theta, gamma all scale with spot price, so we
+            # divide by (S0/100) to match the magnitude the policy saw
+            # during training. Without this, obs[6-8] are 6x out of range
+            # and the policy produces garbage actions.
+            norm_factor = S0 / 100.0
             obs = np.array([
                 price / S0,
                 self.K / S0,
                 T_remaining / T,
                 realized_vol,
-                delta,
-                gamma * 100.0,              # scaled to match training env
+                delta,                                      # dimensionless [0,1]
+                (gamma * 100.0) / norm_factor,              # gamma scales with 1/S
                 np.clip(pnl_norm, -10, 10),
-                vega,
-                np.clip(theta, -10.0, 0.0),
-                vol_carry,
-                float(np.clip(hedge_position, -1.0, 1.0)),
+                vega       / norm_factor,                   # vega scales with S
+                np.clip(theta / norm_factor, -10.0, 0.0),  # theta scales with S
+                vol_carry,                                  # dimensionless ratio
+                float(np.clip(hedge_position, -1.0, 1.0)), # dimensionless [-1,1]
             ], dtype=np.float32)
 
             # Get action
@@ -187,7 +194,7 @@ class HistoricalBacktester:
             target_hedge = float(np.clip(action[0], -1.0, 1.0))
 
             # Transaction cost
-            tc = self.tc_rate * abs(target_hedge - hedge_position) * price
+            tc = self.tc_rate * abs(target_hedge - hedge_position) * (price * 100.0 / S0)
             portfolio_value -= tc
 
             # Update position
@@ -200,13 +207,24 @@ class HistoricalBacktester:
             else:
                 next_price = price
 
-            # PnL
-            price_change = next_price - price
-            hedge_pnl = hedge_position * price_change
+            # PnL — normalise by S0 so units match the training env.
+            # During training, hedge_position is a fraction of 1 unit where
+            # the stock is normalised to S0=100. In the real backtest S0
+            # can be ~$731, so without normalisation a position of 0.5
+            # earns 0.5 * $5 = $2.50/step instead of 0.5 * $0.68 = $0.34.
+            # Dividing price_change by S0 restores the correct scaling.
+            # Normalise price change to training-env scale (S0=100)
+            # hedge_position is in [-1,1], trained on S0=100 prices
+            price_change_norm = (next_price - price) * (100.0 / S0)
+            hedge_pnl = hedge_position * price_change_norm
 
+            # Option PnL: also normalise option values by S0 for consistency
             T_next = max((self.T_days - step - 1) / 252, 1e-10)
-            old_opt = bs_call(price, self.K, T_remaining, self.r, realized_vol)
-            new_opt = bs_call(next_price, self.K, T_next, self.r, realized_vol)
+            # Normalise option prices to training-env scale (S0=100)
+            # so option_pnl and hedge_pnl are in the same units
+            scale = 100.0 / S0
+            old_opt = bs_call(price,      self.K, T_remaining, self.r, realized_vol) * scale
+            new_opt = bs_call(next_price, self.K, T_next,      self.r, realized_vol) * scale
             option_pnl = -(new_opt - old_opt)
 
             total_pnl = hedge_pnl + option_pnl
@@ -217,7 +235,7 @@ class HistoricalBacktester:
 
         # Final settlement
         final_price = self.prices[start_idx + self.T_days]
-        intrinsic = max(final_price - self.K, 0.0)
+        intrinsic = max(final_price - self.K, 0.0) * scale
         portfolio_value -= intrinsic
 
         pnls = np.array(pnl_history)
