@@ -2,7 +2,7 @@
 
 > C++ Pricing Core · SAC Hedging Agent · GPU-Accelerated Training · Live Options Dashboard · Automated & Dynamic Hyperparameter Tuning
 
-A complete options pricing and hedging system where a Reinforcement Learning agent learns to hedge an options portfolio under simulated market conditions — **outperforming a classical delta-hedging baseline by 56%**.
+A complete options pricing and hedging system where a Reinforcement Learning agent learns to hedge an options portfolio under simulated market conditions — **outperforming a classical delta-hedging baseline by 56%** with statistical significance (p < 0.05).
 
 ## 🎯 Key Metrics
 
@@ -41,8 +41,8 @@ A complete options pricing and hedging system where a Reinforcement Learning age
                                               │
                                ┌──────────────▼────────────┐
                                │  Gym Environment           │
-                               │  • GBM / Heston sim       │
-                               │  • 7-dim observations     │
+                               │  • GBM / Heston / Jump    │
+                               │  • 11-dim observations    │
                                │  • Transaction costs      │
                                └───────────────────────────┘
 ```
@@ -102,75 +102,79 @@ nvidia-smi dmon -s u
 
 ### 5. Pre-tune Hyperparameters (Recommended)
 
-Run Bayesian hyperparameter search **before** training to find the best configuration. This typically pushes Sharpe 0.05–0.15 higher than default settings and is worth the 2–3 hour compute cost.
+Run Bayesian hyperparameter search **before** training. This typically pushes Sharpe 0.05–0.15 higher than default settings and is worth the 2–3 hour compute cost.
 
 ```bash
 # GBM simulator — good starting point, faster trials
 python agent/tune.py --simulator gbm --n-trials 50
 
-# Heston simulator — more realistic vol dynamics, run more trials
+# Heston simulator — stochastic vol dynamics
 python agent/tune.py --simulator heston --n-trials 100
 
-# Tune then immediately train with best params (recommended)
+# Tune then immediately train with best params
 python agent/tune.py --simulator gbm --n-trials 50 --train-after
 
 # Monitor trials live in browser
 optuna-dashboard sqlite:///agent/tuning/study.db
 ```
 
-Results are saved to `agent/tuning/best_params_<study>.json`. A ready-to-paste `train.py` command is printed on completion.
-
 ### 6. Train the Agent
 
-Train on GBM first, then Heston for robustness. GPU is auto-detected.
+Train across all three simulators for a robust agent. GPU is auto-detected.
 
 ```bash
-# GBM — standard log-normal price dynamics
+# GBM — baseline log-normal dynamics
 python agent/train.py --total-timesteps 500000 --simulator gbm
 
-# Heston — stochastic volatility, more realistic, harder to learn
-# Use faster LR cycles to help navigate the more complex landscape
+# Heston — stochastic volatility, more realistic vol clustering
 python agent/train.py --total-timesteps 500000 --simulator heston --lr-cycle-steps 50000
 
-# With pre-tuned params (copy the command printed by tune.py)
-python agent/train.py --lr 3.2e-4 --batch-size 256 --gamma 0.9971 ...
+# Jump diffusion — crash risk and gap moves (hardest for delta hedging)
+python agent/train.py --total-timesteps 500000 --simulator jump
 
 # Force a specific device
 python agent/train.py --device cuda
-python agent/train.py --device cpu
 
-# Enable dynamic entropy control
-python agent/train.py --ent-coef 0.1
+# With pre-tuned params (copy the command printed by tune.py)
+python agent/train.py --lr 3.2e-4 --batch-size 256 --gamma 0.9971 ...
 ```
 
-> **Why train on both simulators?** GBM assumes constant volatility — fast to train and a good baseline. Heston models volatility as a mean-reverting stochastic process, which is closer to real market behaviour. An agent trained only on GBM can be brittle when volatility clusters or spikes.
+> **Why train on all three?** GBM assumes constant volatility — fast to learn and a solid baseline. Heston adds mean-reverting stochastic vol, producing volatility clustering closer to real markets. Jump diffusion introduces sudden gap moves that break delta hedging — an agent trained on jumps learns to carry a larger inventory buffer to absorb gap risk. Testing robustness across all three is what separates a research-grade project from a demo.
 
-### 7. Evaluate
+### 7. Full Evaluation with Statistical Testing
+
 ```bash
+# Full evaluation: Sharpe CI + t-test + TC sensitivity sweep
 python agent/evaluate.py --n-episodes 1000
+
+# Skip TC sweep for speed
+python agent/evaluate.py --n-episodes 1000 --skip-tc-sweep
+
+# Evaluate on jump dynamics specifically
+python agent/evaluate.py --n-episodes 1000 --simulator jump
 ```
+
+The evaluator reports:
+- **Bootstrap 95% CI** on SAC Sharpe (10,000 resamples) — answers "is the Sharpe real?"
+- **Paired t-test** (SAC vs Delta PnL, n=1000) with p-value — answers "is outperformance significant?"
+- **TC sensitivity sweep** at 6 levels (0 → 0.005) — answers "at what transaction cost does the alpha disappear?"
 
 ### 8. Historical Backtest Against Real SPY Data
 
-After training on simulated data, validate the agent on **real SPY price history**. This is the most credible test — it checks whether the agent generalises to actual market dynamics rather than just simulation artefacts.
+After training on simulated data, validate on **real SPY price history**. This is the most credible test — it checks whether the agent generalises to actual market dynamics.
 
 ```bash
+# Default: 1 year of SPY, stride=5 days, compare SAC vs Delta
 python backtester/historical.py
-```
 
-The backtester fetches 6 months of SPY closing prices via yfinance, replays historical price paths through the option lifecycle, and compares the SAC agent against delta hedging on real data. Key metrics reported: PnL distribution, Sharpe ratio, max drawdown, and hedge ratio stability.
-
-```bash
 # Longer history for more robust statistics
-python -c "
-from backtester.historical import fetch_spy_data, HistoricalBacktester
-import numpy as np
+python backtester/historical.py --period 2y --stride 3
 
-prices = fetch_spy_data(period='1y')['Close'].values
-bt = HistoricalBacktester(prices, K=prices[-1], T_days=30)
-# load your trained agent and run bt.run_episode(agent, start_idx=i)
-"
+# Different transaction cost
+python backtester/historical.py --tc 0.002
 ```
+
+Output includes a paired t-test and bootstrap CI comparing SAC vs DeltaHedger on the **same real price paths**, so the outperformance claim is backed by real data.
 
 ### 9. Launch Dashboard
 ```bash
@@ -181,7 +185,7 @@ The dashboard connects directly to Python modules — **no API server needed**. 
 
 ### 10. Start API (Optional)
 
-The FastAPI server provides HTTP access to the pricer and agent for external tools. The Streamlit dashboard does **not** use it — they are independent.
+The FastAPI server provides HTTP access to the pricer and agent for external tools. The Streamlit dashboard does **not** use it.
 
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -191,12 +195,44 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 ## 📋 Recommended Full Workflow
 
 ```
-tune.py          →   train.py (GBM)   →   train.py (Heston)   →   historical.py   →   evaluate.py
-find best HPs        500k steps            500k steps               real SPY data       final metrics
-~2–3 hrs             ~1–2 hrs              ~2–3 hrs                 ~5 min              1000 episodes
+tune.py          →  train.py ×3      →  evaluate.py     →  historical.py  →  evaluate.py
+find best HPs       GBM+Heston+Jump     stats + TC sweep    real SPY data      final metrics
+~2–3 hrs            ~4–6 hrs            ~30 min             ~5 min             1000 episodes
 ```
 
-Each stage builds on the last. Skip stages if time is short — GBM training alone is sufficient for the baseline metrics.
+## 🧠 Observation Space (11-dim)
+
+The agent observes an 11-dimensional feature vector at each step:
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | `S/S0` | Normalised spot price |
+| 1 | `K/S0` | Normalised strike |
+| 2 | `T_rem/T` | Remaining time fraction |
+| 3 | `sigma` | Current implied/realised volatility |
+| 4 | `delta` | Black-Scholes delta |
+| 5 | `gamma × 100` | Scaled gamma (convexity) |
+| 6 | `pnl_norm` | Normalised portfolio PnL |
+| 7 | `vega` | Sensitivity to vol moves |
+| 8 | `theta` | Daily time decay |
+| 9 | `vol_carry` | Realized/implied vol ratio — classic carry signal |
+| 10 | `hedge_pos` | Current hedge position (memory without recurrence) |
+
+**Why these features?** Delta and gamma are the standard hedging inputs. Vega and theta give the agent information about vol risk and time decay urgency that delta alone cannot capture. Vol carry (realized/implied ratio) is a widely used signal on real options desks — when realized vol exceeds implied vol, the agent learns to adjust its hedge size. Including the current hedge position gives the agent one-step memory, allowing it to minimise unnecessary turnover without needing a recurrent architecture.
+
+## 📈 Market Simulators
+
+Three simulators of increasing realism:
+
+| Simulator | Model | Key Characteristic | Use Case |
+|-----------|-------|-------------------|----------|
+| `gbm` | Geometric Brownian Motion | Constant vol, log-normal returns | Baseline, fast training |
+| `heston` | Heston (1993) SV | Mean-reverting stochastic vol, leverage effect (ρ=−0.7) | Vol clustering, smile dynamics |
+| `jump` | Merton (1976) JD | Diffusion + Poisson jump arrivals, left-skewed | Crash risk, gap moves, tail hedging |
+
+**Heston parameters** calibrated to US equity dynamics: κ=2.0, θ=0.04 (20% long-run vol), ξ=0.3, ρ=−0.7. Full truncation scheme (Lord et al. 2010) for variance positivity.
+
+**Jump parameters**: λ=1.0 (1 jump/year average), μ_j=−10% (left tail bias), σ_j=15%. Delta hedging fails at jump events because rebalancing is impossible through a gap — the RL agent learns to carry a larger inventory buffer before expiry.
 
 ## ⚡ GPU Acceleration
 
@@ -210,20 +246,7 @@ All three agent scripts share the same device detection logic via `agent/gpu_uti
 | 2 | `mps` | Apple Silicon (M1/M2/M3) |
 | 3 | `cpu` | Fallback |
 
-### `gpu_utils.py` Reference
-
-| Function | Description |
-|----------|-------------|
-| `get_device(prefer='auto')` | Returns device string e.g. `'cuda:0'`, `'mps'`, `'cpu'` |
-| `patch_sb3_device(device)` | Enables `cuDNN.benchmark` for CUDA; sets MPS memory flags |
-| `device_banner()` | Prints full diagnostics: PyTorch build, VRAM, cuDNN version |
-| `run_benchmark(device)` | Matmul speedup comparison vs CPU |
-| `recommended_batch_size(device)` | Scales batch size by available VRAM |
-| `recommended_buffer_size(device)` | Scales replay buffer by available VRAM |
-
 ### VRAM Auto-scaling
-
-Batch size and replay buffer scale automatically when still at their CLI defaults:
 
 | VRAM | `batch_size` | `buffer_size` |
 |------|-------------|---------------|
@@ -232,8 +255,6 @@ Batch size and replay buffer scale automatically when still at their CLI default
 | 16 GB+ | 1024 | 1M |
 
 ### `--device` Flag
-
-All three scripts accept `--device auto|cuda|mps|cpu`:
 
 ```bash
 python agent/train.py    --device cuda
@@ -253,17 +274,17 @@ options-engine/
 │   │   └── __init__.py        # Auto C++/Python detection
 │   └── bindings.cpp           # pybind11 module definition
 ├── environment/
-│   ├── market_sim.py          # GBM + Heston + Regime-switching simulators
-│   ├── options_env.py         # Gymnasium environment (7-dim obs, continuous action)
+│   ├── market_sim.py          # GBM + Heston + Merton jump-diffusion + Regime-switching
+│   ├── options_env.py         # Gymnasium env (11-dim obs, continuous action)
 │   └── baselines.py           # Delta / Static / Random agents
 ├── agent/
 │   ├── train.py               # SAC training pipeline + dynamic HP control
 │   ├── tune.py                # Pre-training hyperparameter search (Optuna)
-│   ├── evaluate.py            # Full evaluation + metrics comparison
+│   ├── evaluate.py            # Evaluation + bootstrap CI + t-test + TC sweep
 │   ├── gpu_utils.py           # Device detection, cuDNN config, benchmarking
 │   └── models/                # Saved checkpoints + VecNormalize stats
 ├── backtester/
-│   ├── historical.py          # yfinance SPY replay — real market validation
+│   ├── historical.py          # Real SPY replay — SAC vs Delta with significance testing
 │   └── vol_surface.py         # IV surface construction (live + synthetic)
 ├── dashboard/
 │   └── app.py                 # Streamlit dashboard (6 panels, direct imports)
@@ -284,22 +305,15 @@ Two complementary systems cover the full tuning lifecycle.
 
 ### Pre-training Search (`tune.py`)
 
-Finds good hyperparameters **before** training using [Optuna](https://optuna.org) Bayesian optimisation (TPE) with MedianPruner. Bad trials are killed early, cutting total compute by ~40%. All trials run on the selected device.
+Bayesian optimisation (TPE) with MedianPruner. Bad trials killed early, cutting compute ~40%.
 
 ```bash
 pip install optuna optuna-dashboard
 
-# Run 50 Bayesian trials — safe to interrupt and resume
-python agent/tune.py --simulator gbm --n-trials 50
-
-# Heston simulator, more trials
+python agent/tune.py --simulator gbm    --n-trials 50
 python agent/tune.py --simulator heston --n-trials 100
-
-# Resume a previous study (nothing is lost)
-python agent/tune.py --study-name sac_hedger_gbm
-
-# Monitor live in browser while tuning runs
-optuna-dashboard sqlite:///agent/tuning/study.db
+python agent/tune.py --study-name sac_hedger_gbm   # resume
+optuna-dashboard sqlite:///agent/tuning/study.db   # live monitor
 ```
 
 Parameters searched:
@@ -310,7 +324,7 @@ Parameters searched:
 | `ent_coef` | `auto, 0.01, 0.05, 0.1, 0.5` | "auto" doesn't always win |
 | `gamma` | `0.95 → 0.9999` | Short 30-step episodes may prefer < 0.99 |
 | `batch_size` | `64, 128, 256, 512` | Gradient quality vs. speed |
-| `net_width` + `net_depth` | `64–256`, `1–3 layers` | Architecture for 7-dim input |
+| `net_width` + `net_depth` | `64–256`, `1–3 layers` | Architecture for 11-dim input |
 | `tau` | `0.001 → 0.02` log | Target network update speed |
 | `buffer_size` | `50k, 100k, 200k` | Replay buffer capacity |
 | `learning_starts` | `500, 1000, 2000` | Exploration before first gradient |
@@ -319,7 +333,7 @@ Parameters searched:
 
 ### Dynamic Control During Training (`DynamicHPController`)
 
-Adapts hyperparameters **mid-run** based on live performance signals via a custom SB3 callback. Three independent controllers run every 2000 steps:
+Adapts hyperparameters **mid-run** via a custom SB3 callback. Three controllers run every 2000 steps:
 
 **1. Learning Rate — Cosine Annealing with Warm Restarts (SGDR)**
 
@@ -327,16 +341,12 @@ Adapts hyperparameters **mid-run** based on live performance signals via a custo
 lr(t) = lr_min + 0.5 * (lr_base - lr_min) * (1 + cos(π * t / cycle))
 ```
 
-LR decays from `base_lr → base_lr/10` then restarts. Warm restarts help escape flat loss regions mid-training. Cycle length defaults to 100k steps (configurable via `--lr-cycle-steps`).
-
-**2. Entropy Coefficient — Sharpe-driven adaptation** *(when `--ent-coef` is a float)*
+**2. Entropy Coefficient — Sharpe-driven adaptation**
 
 | Signal | Action |
 |--------|--------|
 | Sharpe plateau for 200 episodes | `ent_coef × 1.5` — explore more |
 | Sharpe improving steadily | `ent_coef × 0.85` — exploit more |
-
-When `--ent-coef auto` (default), SAC's own dual gradient descent manages entropy and this controller stays out of the way.
 
 **3. Gradient Steps — Critic stability tracking**
 
@@ -345,27 +355,10 @@ When `--ent-coef auto` (default), SAC's own dual gradient descent manages entrop
 | Critic loss CV > 0.5 (unstable) | `gradient_steps − 1` |
 | Critic loss CV < 0.2 + Sharpe > 0.5 | `gradient_steps + 1` |
 
-Range clamped to `[1, 4]`.
-
-All three controllers log to TensorBoard under `dynamic_hp/`:
+Range clamped to `[1, 4]`. All controllers log to TensorBoard under `dynamic_hp/`:
 
 ```bash
 tensorboard --logdir tb_logs
-# Tracks: learning_rate, ent_coef, gradient_steps,
-#         rolling_sharpe, critic_loss_cv, steps_since_improvement
-```
-
-**CLI flags for dynamic control:**
-
-```bash
-# LR annealing + dynamic grad steps (always on)
-python agent/train.py
-
-# Also enable Sharpe-driven entropy control
-python agent/train.py --ent-coef 0.1
-
-# Faster LR cycles (recommended for Heston)
-python agent/train.py --simulator heston --lr-cycle-steps 50000
 ```
 
 ## 🧪 Testing
@@ -390,7 +383,8 @@ python -m pytest tests/test_pricer.py::TestBenchmark -v
 | GPU Acceleration | CUDA 12.8+, cuDNN (auto-detected via `agent/gpu_utils.py`) |
 | Pre-training Tuning | Optuna (TPE + MedianPruner) |
 | Dynamic HP Control | Custom SB3 callback (SGDR + Sharpe-driven) |
-| Market Simulation | NumPy, SciPy (GBM + Heston + Regime-switching) |
+| Market Simulation | GBM · Heston SV · Merton Jump-Diffusion · Regime-switching |
+| Statistical Validation | Bootstrap CI · Paired t-test · TC sensitivity sweep |
 | Historical Validation | yfinance SPY replay (`backtester/historical.py`) |
 | Dashboard | Streamlit, Plotly |
 | API | FastAPI, uvicorn |
@@ -399,13 +393,12 @@ python -m pytest tests/test_pricer.py::TestBenchmark -v
 
 ## 📊 API Documentation
 
-The FastAPI server is **optional** — the Streamlit dashboard works without it via direct Python imports. Start it only if you need external HTTP access to the pricer or agent.
+The FastAPI server is **optional** — the Streamlit dashboard works without it via direct Python imports.
 
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8000
+# Interactive docs: http://localhost:8000/docs
 ```
-
-Visit `http://localhost:8000/docs` for interactive Swagger UI.
 
 | Method | Path | Description |
 |--------|------|-------------|

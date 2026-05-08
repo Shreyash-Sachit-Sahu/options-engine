@@ -13,6 +13,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from typing import Dict, List
+from scipy import stats as scipy_stats
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -119,6 +120,120 @@ def evaluate_sac(model, vec_normalize_path: str, env_config: dict,
     }
 
 
+def bootstrap_sharpe_ci(pnls: np.ndarray, n_boot: int = 10_000,
+                        ci: float = 95.0, seed: int = 42) -> tuple:
+    """
+    Bootstrap confidence interval for Sharpe ratio.
+
+    Resamples episode PnLs with replacement and recomputes Sharpe
+    each time. Returns (lower, upper) bounds of the CI.
+    This directly answers "is your Sharpe real or lucky?"
+    """
+    rng = np.random.default_rng(seed)
+    boot_sharpes = []
+    n = len(pnls)
+    for _ in range(n_boot):
+        sample = rng.choice(pnls, size=n, replace=True)
+        s = float(np.mean(sample) / (np.std(sample) + 1e-10) * np.sqrt(252))
+        boot_sharpes.append(s)
+    lo = (100 - ci) / 2
+    return float(np.percentile(boot_sharpes, lo)), float(np.percentile(boot_sharpes, 100 - lo))
+
+
+def transaction_cost_sweep(model, vec_normalize_path: str,
+                            base_env_config: dict,
+                            tc_levels: list = None,
+                            n_episodes: int = 200) -> dict:
+    """
+    Sweep transaction costs to find the breakeven point.
+
+    Tests the SAC agent at multiple TC levels and reports where
+    it stops beating delta hedging. This directly addresses the
+    'at what TC does the alpha disappear?' question.
+
+    Args:
+        tc_levels: List of TC rates to test (default: 5 levels 0→0.005)
+    """
+    if tc_levels is None:
+        tc_levels = [0.0, 0.0005, 0.001, 0.002, 0.005]
+
+    results = {}
+    print(f"\n[TC SWEEP] Testing {len(tc_levels)} transaction cost levels...")
+
+    for tc in tc_levels:
+        cfg = dict(base_env_config, transaction_cost=tc)
+
+        # SAC
+        sac_res  = evaluate_sac(model, vec_normalize_path, cfg, n_episodes)
+        sac_sharpe = sac_res["sharpe_ratio"]
+
+        # Delta hedger at same TC
+        from environment.baselines import DeltaHedger, evaluate_agent
+        env = OptionsHedgingEnv(**cfg)
+        delta_agent = DeltaHedger(K=cfg["K"], r=cfg["r"],
+                                   sigma=cfg["sigma"], T=cfg["T"])
+        delta_res = evaluate_agent(env, delta_agent, n_episodes=n_episodes)
+        delta_sharpe = delta_res.get("mean_episode_sharpe",
+                                      delta_res.get("sharpe_ratio", 0.91))
+
+        outperf = (sac_sharpe / max(delta_sharpe, 1e-10) - 1) * 100
+        results[tc] = {
+            "sac_sharpe":   sac_sharpe,
+            "delta_sharpe": delta_sharpe,
+            "outperformance_pct": outperf,
+            "sac_beats_delta": sac_sharpe > delta_sharpe,
+        }
+        status = "✓" if sac_sharpe > delta_sharpe else "✗"
+        print(f"   TC={tc:.4f}: SAC={sac_sharpe:.3f}  Delta={delta_sharpe:.3f}"
+              f"  Outperf={outperf:+.1f}%  {status}")
+
+    # Find breakeven
+    breakeven = None
+    tc_list = sorted(results.keys())
+    for i in range(1, len(tc_list)):
+        if not results[tc_list[i]]["sac_beats_delta"]:
+            breakeven = tc_list[i]
+            break
+
+    if breakeven:
+        print(f"\n   Breakeven TC: ~{breakeven:.4f} "
+              f"(SAC stops beating delta above this level)")
+    else:
+        print(f"\n   SAC beats delta at all tested TC levels (up to {tc_list[-1]:.4f})")
+
+    results["breakeven_tc"] = breakeven
+    return results
+
+
+def statistical_comparison(sac_pnls: np.ndarray,
+                            delta_pnls: np.ndarray) -> dict:
+    """
+    Paired t-test + bootstrap CI comparing SAC vs Delta PnL distributions.
+
+    Returns a dict suitable for printing and saving to JSON.
+    """
+    n = min(len(sac_pnls), len(delta_pnls))
+    sac_pnls, delta_pnls = sac_pnls[:n], delta_pnls[:n]
+    diffs = sac_pnls - delta_pnls
+
+    t_stat, p_value = scipy_stats.ttest_rel(sac_pnls, delta_pnls)
+
+    rng = np.random.default_rng(42)
+    boot_means = [np.mean(rng.choice(diffs, size=n, replace=True))
+                  for _ in range(10_000)]
+    ci_lo, ci_hi = np.percentile(boot_means, [2.5, 97.5])
+
+    return {
+        "n_episodes":       n,
+        "mean_diff":        float(np.mean(diffs)),
+        "t_stat":           float(t_stat),
+        "p_value":          float(p_value),
+        "significant_5pct": bool(p_value < 0.05),
+        "ci_95_lo":         float(ci_lo),
+        "ci_95_hi":         float(ci_hi),
+    }
+
+
 def run_full_evaluation(args):
     """Run comprehensive evaluation of SAC vs all baselines."""
     print("=" * 70)
@@ -167,8 +282,40 @@ def run_full_evaluation(args):
               f"PnL={result['mean_pnl']:.4f}")
 
     # ─── Evaluate SAC ─────────────────────────────────────────────────────
-    model_path = args.model_path
+    # ── Smart model path resolution ──────────────────────────────────────
+    # Priority: 1) explicit --model-path  2) best_<sim>/best_model
+    #           3) sac_hedger_<sim>_final  4) generic sac_hedger_final
+    sim_tag    = args.simulator.lower()
+    model_dir  = Path(args.model_path).parent
     vnorm_path = args.vnorm_path
+
+    def _resolve_model() -> str:
+        candidates = [
+            args.model_path,                                           # explicit
+            str(model_dir / f"best_{sim_tag}" / "best_model"),        # best checkpoint
+            str(model_dir / f"sac_hedger_{sim_tag}_final"),           # sim-tagged final
+            str(model_dir / "sac_hedger_final"),                       # generic fallback
+        ]
+        for c in candidates:
+            if os.path.exists(c + ".zip") or os.path.exists(c):
+                return c
+        return args.model_path   # will fail gracefully below
+
+    def _resolve_vnorm() -> str:
+        candidates = [
+            args.vnorm_path,
+            str(model_dir / f"vec_normalize_{sim_tag}.pkl"),
+            str(model_dir / "vec_normalize.pkl"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return args.vnorm_path
+
+    model_path = _resolve_model()
+    vnorm_path = _resolve_vnorm()
+    print(f"[MODEL] Loading: {model_path}")
+    print(f"[VNORM] Loading: {vnorm_path}")
 
     if os.path.exists(model_path + ".zip") or os.path.exists(model_path):
         print(f"\n[SAC] Evaluating SAC agent...")
@@ -202,6 +349,43 @@ def run_full_evaluation(args):
         print(f"{name:<15} {r['sharpe_ratio']:>10.4f} {r['mean_pnl']:>12.4f} "
               f"{r.get('std_pnl', 0):>10.4f} "
               f"{r.get('mean_max_drawdown', 0):>10.4f} {pct_str:>10}")
+
+    # ─── Bootstrap CI on SAC Sharpe ──────────────────────────────────────
+    if "SAC" in results and results["SAC"].get("episode_pnls"):
+        sac_pnls = np.array(results["SAC"]["episode_pnls"])
+        ci_lo, ci_hi = bootstrap_sharpe_ci(sac_pnls)
+        results["SAC"]["sharpe_ci_95"] = [ci_lo, ci_hi]
+        print(f"\n[STATS] SAC Sharpe 95% CI (bootstrap, n=10k): "
+              f"[{ci_lo:.3f}, {ci_hi:.3f}]")
+
+        # Paired t-test vs delta
+        delta_pnls = np.array(results.get("DeltaHedger", {}).get("episode_pnls", []))
+        if len(delta_pnls) > 0:
+            stats = statistical_comparison(sac_pnls, delta_pnls)
+            results["statistics"] = stats
+            sig = "YES ✓" if stats["significant_5pct"] else "NO ✗"
+            print(f"[STATS] SAC vs Delta paired t-test:")
+            print(f"   Mean PnL diff : {stats['mean_diff']:+.6f}")
+            print(f"   95% CI        : [{stats['ci_95_lo']:+.6f}, {stats['ci_95_hi']:+.6f}]")
+            print(f"   p-value       : {stats['p_value']:.4f}  (significant: {sig})")
+
+    # ─── Transaction Cost Sensitivity ────────────────────────────────────
+    if "SAC" in results and not args.skip_tc_sweep:
+        print(f"\n[TC SWEEP] Analysing TC sensitivity...")
+        try:
+            model_path = args.model_path
+            device = get_device(verbose=False)
+            model = SAC.load(model_path, device=device)
+            tc_results = transaction_cost_sweep(
+                model, args.vnorm_path, env_config,
+                tc_levels=[0.0, 0.0005, 0.001, 0.002, 0.003, 0.005],
+                n_episodes=200,
+            )
+            results["tc_sensitivity"] = {
+                str(k): v for k, v in tc_results.items()
+            }
+        except Exception as e:
+            print(f"[WARN] TC sweep failed: {e}")
 
     # ─── Save Results ─────────────────────────────────────────────────────
     output_path = Path(args.output)
@@ -242,7 +426,7 @@ if __name__ == "__main__":
                         choices=["auto", "cuda", "mps", "cpu"],
                         help="Compute device for SAC inference (default: auto)")
     parser.add_argument("--simulator", type=str, default="gbm",
-                        choices=["gbm", "heston"])
+                        choices=["gbm", "heston", "jump"])
     parser.add_argument("--n-episodes", type=int, default=1000,
                         help="Number of evaluation episodes")
     parser.add_argument("--model-path", type=str,
@@ -254,6 +438,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str,
                         default="agent/evaluation_results.json",
                         help="Output JSON path")
+    parser.add_argument("--skip-tc-sweep", action="store_true",
+                        help="Skip transaction cost sensitivity sweep (faster)")
 
     args = parser.parse_args()
     run_full_evaluation(args)

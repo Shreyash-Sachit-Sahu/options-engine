@@ -156,16 +156,30 @@ class HistoricalBacktester:
                 delta = 0.5
                 gamma = 0.01
 
-            # Build observation
+            # Build 11-dim observation (matches options_env._get_obs)
             pnl_norm = (portfolio_value - premium) / max(premium, 1e-6)
+
+            # Vol carry: realized / implied ratio
+            vol_carry = float(np.clip(realized_vol / max(self.sigma, 1e-6), 0.0, 5.0))
+
+            try:
+                vega  = float(greeks_call(price, self.K, T_remaining, self.r, realized_vol).vega)
+                theta = float(greeks_call(price, self.K, T_remaining, self.r, realized_vol).theta)
+            except Exception:
+                vega, theta = 0.0, 0.0
+
             obs = np.array([
                 price / S0,
                 self.K / S0,
                 T_remaining / T,
                 realized_vol,
                 delta,
-                gamma,
+                gamma * 100.0,              # scaled to match training env
                 np.clip(pnl_norm, -10, 10),
+                vega,
+                np.clip(theta, -10.0, 0.0),
+                vol_carry,
+                float(np.clip(hedge_position, -1.0, 1.0)),
             ], dtype=np.float32)
 
             # Get action
@@ -208,22 +222,39 @@ class HistoricalBacktester:
 
         pnls = np.array(pnl_history)
 
+        # Normalise PnL by premium so results are comparable across
+        # different price levels and option maturities.
+        # This matches how the training env computes rewards.
+        pnls_norm = pnls / max(premium, 1e-6)
+        total_pnl_norm = float(np.sum(pnls_norm))
+
+        # Sharpe on normalised daily PnL, annualised
+        sharpe = float(
+            np.mean(pnls_norm) / (np.std(pnls_norm) + 1e-10) * np.sqrt(252)
+        )
+
+        # Max drawdown on normalised cumulative PnL
+        cum_pnl = np.cumsum(pnls_norm)
+        running_max = np.maximum.accumulate(cum_pnl)
+        drawdowns_arr = running_max - cum_pnl
+        max_dd = float(np.max(drawdowns_arr)) if len(drawdowns_arr) > 0 else 0.0
+
         return {
             "portfolio_value": portfolio_value,
-            "total_pnl": float(np.sum(pnls)),
-            "premium": premium,
-            "pnl_history": pnl_history,
-            "hedge_history": hedge_history,
-            "price_history": price_history,
-            "sharpe": float(
-                np.mean(pnls) / (np.std(pnls) + 1e-10) * np.sqrt(252)
-            ),
-            "max_drawdown": float(self._max_drawdown(pnls)),
+            "total_pnl":       total_pnl_norm,        # normalised by premium
+            "total_pnl_raw":   float(np.sum(pnls)),   # raw dollars (for reference)
+            "premium":         premium,
+            "pnl_history":     pnls_norm.tolist(),
+            "pnl_history_raw": pnl_history,
+            "hedge_history":   hedge_history,
+            "price_history":   price_history,
+            "sharpe":          sharpe,
+            "max_drawdown":    max_dd,
             "transaction_costs": float(
                 sum(self.tc_rate * abs(hedge_history[i] - (
                     hedge_history[i-1] if i > 0 else 0
                 )) * price_history[i] for i in range(len(hedge_history)))
-            ),
+            ) / max(premium, 1e-6),   # also normalised
         }
 
     def run_backtest(self, agent, stride: int = 5) -> dict:
@@ -279,19 +310,188 @@ class HistoricalBacktester:
 
 
 if __name__ == "__main__":
-    print("Fetching SPY data...")
-    hist = fetch_spy_data("6mo")
+    import argparse, json
+    from pathlib import Path
+    from scipy import stats as scipy_stats
+
+    parser = argparse.ArgumentParser(description="Historical SPY backtest")
+    parser.add_argument("--period",     default="1y",
+                        help="yfinance period: 6mo, 1y, 2y (default: 1y)")
+    parser.add_argument("--stride",     type=int, default=5,
+                        help="Days between episode start points (default: 5)")
+    parser.add_argument("--tc",         type=float, default=0.001,
+                        help="Transaction cost rate (default: 0.001)")
+    parser.add_argument("--model-path", default="agent/models/sac_hedger_final",
+                        help="Path to trained SAC model")
+    parser.add_argument("--vnorm-path", default=None,
+                        help="Path to VecNormalize stats (auto-detected if omitted)")
+    parser.add_argument("--output",     default="agent/historical_results.json")
+    args = parser.parse_args()
+
+    print("=" * 65)
+    print("  Historical SPY Backtest — SAC vs Delta Hedger")
+    print("=" * 65)
+
+    # ── Fetch data ────────────────────────────────────────────────────
+    hist  = fetch_spy_data(args.period)
     prices = hist["Close"].values
+    K     = float(np.median(prices))      # median as proxy for ATM strike
+    sigma = float(np.std(np.diff(np.log(prices))) * np.sqrt(252))
+    print(f"\n  Estimated historical vol: {sigma:.1%}")
+    print(f"  ATM strike (median spot): {K:.2f}")
 
-    print(f"\nRunning backtest with DeltaHedger...")
+    bt = HistoricalBacktester(prices, K=K, sigma=sigma,
+                               transaction_cost=args.tc)
+
+    # Auto-detect VecNormalize path: prefer sim-tagged, fall back to generic
+    if args.vnorm_path is None:
+        model_dir = Path(args.model_path).parent
+        sim_tag = Path(args.model_path).stem.replace("sac_hedger_", "").replace("_final", "")
+        candidates = [
+            str(model_dir / f"vec_normalize_{sim_tag}.pkl"),
+            str(model_dir / "vec_normalize.pkl"),
+        ]
+        args.vnorm_path = next((c for c in candidates if Path(c).exists()),
+                               str(model_dir / "vec_normalize.pkl"))
+    print(f"  VecNormalize path : {args.vnorm_path}")
+
+    # ── Delta Hedger baseline ─────────────────────────────────────────
     from environment.baselines import DeltaHedger
+    delta_agent = DeltaHedger(K=K, sigma=sigma)
+    print(f"\n[DELTA] Running delta hedge backtest...")
+    delta_results = bt.run_backtest(delta_agent, stride=args.stride)
+    print(f"  Episodes : {delta_results['n_episodes']}")
+    print(f"  Sharpe   : {delta_results['sharpe_ratio']:.4f}")
+    print(f"  Mean PnL : {delta_results['mean_pnl']:.6f}")
+    print(f"  Max DD   : {delta_results['max_max_drawdown']:.6f}")
 
-    K = float(np.mean(prices))  # ATM strike
-    bt = HistoricalBacktester(prices, K=K, sigma=0.2)
-    agent = DeltaHedger(K=K)
+    all_results = {"DeltaHedger": delta_results}
 
-    results = bt.run_backtest(agent, stride=5)
-    print(f"\nResults ({results['n_episodes']} episodes):")
-    print(f"  Sharpe: {results['sharpe_ratio']:.4f}")
-    print(f"  Mean PnL: {results['mean_pnl']:.4f}")
-    print(f"  Max Drawdown: {results['max_max_drawdown']:.4f}")
+    # ── SAC Agent ─────────────────────────────────────────────────────
+    model_zip = args.model_path + ".zip"
+    if Path(args.model_path).exists() or Path(model_zip).exists():
+        print(f"\n[SAC] Loading model from {args.model_path}...")
+        try:
+            from stable_baselines3 import SAC
+            from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+            from agent.gpu_utils import get_device
+            import os
+
+            device = get_device(verbose=True)
+            sac_model = SAC.load(args.model_path, device=device)
+
+            # Wrap SAC into an agent interface compatible with run_backtest
+            class SACAgent:
+                """
+                Wraps a SAC model with VecNormalize statistics.
+
+                Uses the actual VecNormalize object (not manual obs_rms)
+                to ensure observations are normalised identically to
+                how they were during training.
+                """
+                def __init__(self, model, vnorm_path):
+                    self.model = model
+                    self._vn = None
+                    if os.path.exists(vnorm_path):
+                        try:
+                            from stable_baselines3.common.vec_env import (
+                                DummyVecEnv, VecNormalize
+                            )
+                            from environment.options_env import OptionsHedgingEnv
+                            # Create a dummy env just to load normalisation stats
+                            dummy = DummyVecEnv([lambda: OptionsHedgingEnv()])
+                            vn = VecNormalize.load(vnorm_path, dummy)
+                            vn.training = False   # freeze stats
+                            vn.norm_reward = False
+                            self._vn = vn
+                            print(f"[SAC] VecNormalize loaded: "
+                                  f"obs_mean={vn.obs_rms.mean[:3].round(3)}...")
+                        except Exception as e:
+                            print(f"[WARN] VecNormalize load failed: {e}. "
+                                  f"Using raw observations.")
+                    else:
+                        print(f"[WARN] VecNormalize not found at {vnorm_path}. "
+                              f"Observations will NOT be normalised — results "
+                              f"may be unreliable.")
+
+                def predict(self, obs):
+                    obs_in = obs.reshape(1, -1).astype(np.float32)
+                    if self._vn is not None:
+                        # normalise using the frozen VecNormalize stats
+                        obs_in = self._vn.normalize_obs(obs_in)
+                    action, state = self.model.predict(
+                        obs_in, deterministic=True
+                    )
+                    return action[0], state
+
+            sac_agent = SACAgent(sac_model, args.vnorm_path)
+            print(f"[SAC] Running SAC backtest on same real SPY paths...")
+            sac_results = bt.run_backtest(sac_agent, stride=args.stride)
+            all_results["SAC"] = sac_results
+            print(f"  Episodes : {sac_results['n_episodes']}")
+            print(f"  Sharpe   : {sac_results['sharpe_ratio']:.4f}")
+            print(f"  Mean PnL : {sac_results['mean_pnl']:.6f}")
+            print(f"  Max DD   : {sac_results['max_max_drawdown']:.6f}")
+
+        except Exception as e:
+            print(f"[WARN] SAC evaluation failed: {e}")
+    else:
+        print(f"\n[WARN] No SAC model found at {args.model_path}.")
+        print("       Run `python agent/train.py` first.")
+
+    # ── Statistical Significance ──────────────────────────────────────
+    if "SAC" in all_results:
+        sac_pnls   = np.array([e["total_pnl"] for e in all_results["SAC"]["episodes"]])
+        delta_pnls = np.array([e["total_pnl"] for e in all_results["DeltaHedger"]["episodes"]])
+        n = min(len(sac_pnls), len(delta_pnls))
+        sac_pnls, delta_pnls = sac_pnls[:n], delta_pnls[:n]
+
+        t_stat, p_value = scipy_stats.ttest_rel(sac_pnls, delta_pnls)
+        diff_mean = np.mean(sac_pnls - delta_pnls)
+
+        # Bootstrap 95% CI on mean PnL difference
+        rng = np.random.default_rng(42)
+        boot_diffs = []
+        for _ in range(10_000):
+            idx = rng.integers(0, n, size=n)
+            boot_diffs.append(np.mean(sac_pnls[idx] - delta_pnls[idx]))
+        ci_lo, ci_hi = np.percentile(boot_diffs, [2.5, 97.5])
+
+        print(f"\n{'=' * 65}")
+        print(f"  STATISTICAL SIGNIFICANCE (paired t-test, n={n} episodes)")
+        print(f"{'=' * 65}")
+        print(f"  SAC vs Delta mean PnL difference : {diff_mean:+.6f}")
+        print(f"  95% Bootstrap CI                 : [{ci_lo:+.6f}, {ci_hi:+.6f}]")
+        print(f"  t-statistic                      : {t_stat:.4f}")
+        print(f"  p-value                          : {p_value:.4f}")
+        sig = "YES ✓" if p_value < 0.05 else "NO ✗ (not significant)"
+        print(f"  Significant at 5% level          : {sig}")
+
+        sac_sharpe   = all_results["SAC"]["sharpe_ratio"]
+        delta_sharpe = all_results["DeltaHedger"]["sharpe_ratio"]
+        outperf      = (sac_sharpe / max(delta_sharpe, 1e-10) - 1) * 100
+        print(f"\n  Sharpe outperformance on REAL DATA: {outperf:+.1f}%")
+
+        all_results["statistics"] = {
+            "t_stat": float(t_stat),
+            "p_value": float(p_value),
+            "mean_pnl_diff": float(diff_mean),
+            "ci_95_lo": float(ci_lo),
+            "ci_95_hi": float(ci_hi),
+            "significant_5pct": bool(p_value < 0.05),
+            "sharpe_outperformance_pct": float(outperf),
+        }
+
+    # ── Save ──────────────────────────────────────────────────────────
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # strip episode lists for cleaner JSON (keep summary stats)
+    save_results = {}
+    for k, v in all_results.items():
+        if isinstance(v, dict):
+            save_results[k] = {kk: vv for kk, vv in v.items() if kk != "episodes"}
+        else:
+            save_results[k] = v
+    with open(out, "w") as f:
+        json.dump(save_results, f, indent=2)
+    print(f"\n[SAVE] Results saved to: {out}")

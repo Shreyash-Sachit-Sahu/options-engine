@@ -22,7 +22,7 @@ from typing import Optional, Dict, Any, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.pricer.pricer_py import bs_call, greeks_call
-from environment.market_sim import GBMSimulator, HestonSimulator
+from environment.market_sim import GBMSimulator, HestonSimulator, MertonJumpDiffusionSimulator
 
 
 class OptionsHedgingEnv(gym.Env):
@@ -33,14 +33,18 @@ class OptionsHedgingEnv(gym.Env):
     trading the underlying asset. The goal is to minimise PnL variance
     (i.e., hedge as perfectly as possible) while managing transaction costs.
 
-    Observation Space (7-dim):
-        [0] S/S0           — normalised spot price
-        [1] K/S0           — normalised strike
-        [2] T_rem/T_total  — remaining time fraction
-        [3] sigma          — current implied/realised volatility
-        [4] delta          — Black-Scholes delta
-        [5] gamma          — Black-Scholes gamma
-        [6] portfolio_pnl  — normalised portfolio PnL
+    Observation Space (11-dim):
+        [0]  S/S0              — normalised spot price
+        [1]  K/S0              — normalised strike
+        [2]  T_rem/T_total     — remaining time fraction
+        [3]  sigma             — current implied/realised volatility
+        [4]  delta             — Black-Scholes delta
+        [5]  gamma             — Black-Scholes gamma (scaled x100)
+        [6]  portfolio_pnl     — normalised portfolio PnL
+        [7]  vega              — option vega (sensitivity to vol)
+        [8]  theta             — option theta (time decay, annualised)
+        [9]  vol_carry         — realized/implied vol ratio (carry signal)
+        [10] current_hedge     — current hedge position (memory)
 
     Action Space:
         Box([-1], [1]) — delta adjustment
@@ -80,6 +84,9 @@ class OptionsHedgingEnv(gym.Env):
         theta: float = 0.04,
         xi: float = 0.3,
         rho: float = -0.7,
+        lam: float = 1.0,
+        mu_j: float = -0.10,
+        sigma_j: float = 0.15,
         render_mode: Optional[str] = None,
     ):
         super().__init__()
@@ -100,14 +107,44 @@ class OptionsHedgingEnv(gym.Env):
                 S0=S0, mu=mu, v0=sigma**2, kappa=kappa,
                 theta=theta, xi=xi, rho=rho, dt=self.dt, seed=seed
             )
+        elif simulator_type == "jump":
+            self.simulator = MertonJumpDiffusionSimulator(
+                S0=S0, mu=mu, sigma=sigma,
+                lam=lam, mu_j=mu_j, sigma_j=sigma_j,
+                dt=self.dt, seed=seed
+            )
         else:
             self.simulator = GBMSimulator(
                 S0=S0, mu=mu, sigma=sigma, dt=self.dt, seed=seed
             )
 
         self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0, 0.0, -1.0, 0.0, -np.inf], dtype=np.float32),
-            high=np.array([5.0, 5.0, 1.0, 5.0,  1.0, np.inf, np.inf], dtype=np.float32),
+            low=np.array([
+                0.0,     # S/S0
+                0.0,     # K/S0
+                0.0,     # T_fraction
+                0.0,     # sigma
+               -1.0,     # delta
+                0.0,     # gamma (scaled)
+               -np.inf,  # portfolio_pnl
+                0.0,     # vega
+               -np.inf,  # theta
+                0.0,     # vol_carry
+               -1.0,     # current_hedge
+            ], dtype=np.float32),
+            high=np.array([
+                5.0,     # S/S0
+                5.0,     # K/S0
+                1.0,     # T_fraction
+                5.0,     # sigma
+                1.0,     # delta
+                np.inf,  # gamma (scaled)
+                np.inf,  # portfolio_pnl
+                np.inf,  # vega
+                0.0,     # theta (always <= 0 for long option; we short so positive)
+                5.0,     # vol_carry
+                1.0,     # current_hedge
+            ], dtype=np.float32),
             dtype=np.float32
         )
         self.action_space = spaces.Box(
@@ -227,23 +264,42 @@ class OptionsHedgingEnv(gym.Env):
         return self._get_obs(), float(reward), terminated, truncated, self._get_info(episode_done=terminated)
 
     def _get_obs(self) -> np.ndarray:
-        """Construct observation vector."""
+        """
+        Construct 11-dim observation vector.
+
+        Features beyond basic 7:
+          vega       — sensitivity to vol moves; agent learns to manage
+                       vol risk differently near expiry
+          theta      — time decay per day; signals urgency near expiry
+          vol_carry  — realized/implied ratio; > 1 means vol is cheap,
+                       a classic signal used by real options desks
+          hedge_pos  — current position (memory without recurrence)
+        """
         T_remaining = max(self.T - self.current_step * self.dt, 1e-10)
         T_fraction = T_remaining / self.T
 
         try:
             g = greeks_call(self.price, self.K, T_remaining,
                             self.r, self.current_vol)
-            delta = g.delta
-            gamma = g.gamma
+            delta = float(g.delta)
+            gamma = float(g.gamma)
+            vega  = float(g.vega)
+            theta = float(g.theta)
         except Exception:
             delta = 0.5
             gamma = 0.01
+            vega  = 0.0
+            theta = 0.0
 
         pnl_normalised = (
             (self.portfolio_value - self.option_premium)
             / max(self.option_premium, 1e-6)
         )
+
+        # Vol carry: realized_vol / implied_vol — classic signal
+        # > 1 → realized > implied (vol is cheap, agent may over-hedge)
+        # < 1 → realized < implied (vol is rich, agent may under-hedge)
+        vol_carry = float(np.clip(self.current_vol / max(self.sigma, 1e-6), 0.0, 5.0))
 
         return np.array([
             self.price / self.S0,
@@ -251,8 +307,12 @@ class OptionsHedgingEnv(gym.Env):
             T_fraction,
             self.current_vol,
             delta,
-            gamma,
+            gamma * 100.0,                  # scale gamma (typically 0.001–0.05)
             np.clip(pnl_normalised, -10, 10),
+            vega,
+            np.clip(theta, -10.0, 0.0),     # theta always negative (short option)
+            vol_carry,
+            float(np.clip(self.hedge_position, -1.0, 1.0)),
         ], dtype=np.float32)
 
     def _get_info(self, episode_done: bool = False) -> Dict[str, Any]:
@@ -316,5 +376,3 @@ class OptionsHedgingEnv(gym.Env):
               f"Hedge={self.hedge_position:+.4f} | "
               f"PV={self.portfolio_value:8.4f} | "
               f"T_rem={T_rem:.4f}y")
-
-              

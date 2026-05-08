@@ -170,12 +170,31 @@ class DynamicHPController(BaseCallback):
 
     def _on_step(self) -> bool:
 
-        # Collect episode Sharpe
+        # ── Collect episode Sharpe ─────────────────────────────────────────
+        # SB3 + VecNormalize passes custom info keys via two routes:
+        #   1. infos[i]["episode_sharpe"]       — direct (older SB3)
+        #   2. infos[i]["final_info"]["episode_sharpe"] — Gymnasium vec env
+        # Fallback: compute Sharpe proxy from raw episode reward
         for info in self.locals.get("infos", []):
+            sharpe = None
             if "episode_sharpe" in info:
-                self._sharpe_history.append(info["episode_sharpe"])
+                sharpe = info["episode_sharpe"]
+            elif "final_info" in info and info["final_info"] is not None:
+                fi = info["final_info"]
+                if isinstance(fi, dict) and "episode_sharpe" in fi:
+                    sharpe = fi["episode_sharpe"]
 
-        # Collect critic loss from SB3 logger
+            if sharpe is None and "episode" in info:
+                # Proxy: treat normalised episode reward as Sharpe estimate
+                # This is a rough approximation but keeps the deque filling
+                ep_r = info["episode"]["r"]
+                ep_l = max(info["episode"]["l"], 1)
+                sharpe = float(ep_r / (abs(ep_r / ep_l) + 1e-8))
+
+            if sharpe is not None:
+                self._sharpe_history.append(float(sharpe))
+
+        # ── Collect critic loss from SB3 logger ───────────────────────────
         if hasattr(self.model, 'logger'):
             name_map = self.model.logger.name_to_value
             if "train/critic_loss" in name_map:
@@ -422,9 +441,10 @@ def train(args):
     print(f"   GradSteps → dynamic [1–4] based on critic loss stability")
 
     # ─── Callbacks ────────────────────────────────────────────────────────
+    sim_tag_early = args.simulator.lower()
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=str(model_dir / "best"),
+        best_model_save_path=str(model_dir / f"best_{sim_tag_early}"),
         log_path=str(log_dir / "eval"),
         eval_freq=max(args.total_timesteps // 50, 1000),
         n_eval_episodes=20,
@@ -470,11 +490,28 @@ def train(args):
     print(f"\n[DONE] Training complete in {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     # ─── Save ─────────────────────────────────────────────────────────────
-    final_path = str(model_dir / "sac_hedger_final")
+    # Include simulator name so GBM/Heston/Jump models don't overwrite each other
+    sim_tag    = args.simulator.lower()
+    final_name = f"sac_hedger_{sim_tag}_final"
+    final_path = str(model_dir / final_name)
+    vnorm_name = f"vec_normalize_{sim_tag}.pkl"
+    vnorm_path = str(model_dir / vnorm_name)
+
     model.save(final_path)
+    train_envs.save(vnorm_path)
+
+    # Also save a generic "latest" pointer so evaluate.py works without flags
+    model.save(str(model_dir / "sac_hedger_final"))
     train_envs.save(str(model_dir / "vec_normalize.pkl"))
+
     print(f"\n[SAVE] Model      : {final_path}.zip")
-    print(f"       VecNormalize: {model_dir}/vec_normalize.pkl")
+    print(f"       Best model  : {model_dir}/best_{sim_tag}/best_model.zip")
+    print(f"       VecNormalize: {vnorm_path}")
+    print(f"       Generic link: {model_dir}/sac_hedger_final.zip  (latest run)")
+    print(f"\n[TIP]  To evaluate this specific model:")
+    print(f"         python agent/evaluate.py --simulator {sim_tag} \\")
+    print(f"           --model-path {final_path} \\")
+    print(f"           --vnorm-path {vnorm_path}")
 
     # ─── Quick Evaluation (fixed seeding) ─────────────────────────────────
     print(f"\n[EVAL] Quick evaluation (100 episodes)...")
@@ -545,7 +582,7 @@ if __name__ == "__main__":
                         help="Compute device: auto (default), cuda, mps, or cpu")
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--simulator", type=str, default="gbm",
-                        choices=["gbm", "heston"])
+                        choices=["gbm", "heston", "jump"])
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lr-cycle-steps", type=int, default=100_000,
                         help="Steps per cosine annealing LR cycle")

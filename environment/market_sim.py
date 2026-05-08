@@ -266,6 +266,140 @@ class HestonSimulator:
         return self.step_count * self.dt
 
 
+
+
+class MertonJumpDiffusionSimulator:
+    """
+    Merton (1976) Jump-Diffusion model.
+
+    dS/S = (mu - lambda*k_bar) dt + sigma dW + J dN
+
+    where:
+        dN  ~ Poisson(lambda * dt)   — jump arrival
+        J   ~ LogNormal(mu_j, sigma_j) — jump size
+        k_bar = exp(mu_j + 0.5*sigma_j^2) - 1  — mean jump size
+
+    This is the most important model for stress-testing the RL agent:
+    delta hedging fails badly at jump events because the hedge cannot
+    be rebalanced instantaneously. A robust agent learns to carry a
+    larger inventory buffer before expiry to absorb gap risk.
+
+    Typical US equity parameters:
+        lambda=1.0  (1 jump per year on average)
+        mu_j=-0.10  (average -10% jump — left tail)
+        sigma_j=0.15 (jump size uncertainty)
+    """
+
+    def __init__(self, S0: float = 100.0, mu: float = 0.05,
+                 sigma: float = 0.15, lam: float = 1.0,
+                 mu_j: float = -0.10, sigma_j: float = 0.15,
+                 dt: float = 1/252, seed: Optional[int] = 42):
+        """
+        Args:
+            S0:      Initial spot price
+            mu:      Continuous drift
+            sigma:   Diffusive (non-jump) volatility
+            lam:     Jump intensity (jumps per year)
+            mu_j:    Mean log jump size (negative = left-skewed)
+            sigma_j: Std of log jump size
+            dt:      Time step (1/252 = daily)
+            seed:    Random seed
+        """
+        self.S0 = S0
+        self.mu = mu
+        self.sigma = sigma
+        self.lam = lam
+        self.mu_j = mu_j
+        self.sigma_j = sigma_j
+        self.dt = dt
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+
+        # Mean jump size for drift correction
+        self.k_bar = np.exp(mu_j + 0.5 * sigma_j**2) - 1
+
+        # State
+        self.price = S0
+        self.step_count = 0
+        self._prices = [S0]
+        self._had_jump = [False]
+
+    def reset(self, seed: Optional[int] = None) -> float:
+        if seed is not None:
+            self.seed = seed
+        self.rng = np.random.default_rng(self.seed)
+        self.price = self.S0
+        self.step_count = 0
+        self._prices = [self.S0]
+        self._had_jump = [False]
+        return self.price
+
+    def step(self) -> Tuple[float, float]:
+        """
+        Advance one time step under Merton jump-diffusion.
+
+        Returns:
+            (new_price, realized_vol_including_jump_variance)
+        """
+        # Diffusive component
+        Z = self.rng.standard_normal()
+        drift = (self.mu - self.lam * self.k_bar - 0.5 * self.sigma**2) * self.dt
+        diffusion = self.sigma * np.sqrt(self.dt) * Z
+        log_return = drift + diffusion
+
+        # Jump component — Poisson number of jumps this step
+        n_jumps = self.rng.poisson(self.lam * self.dt)
+        had_jump = n_jumps > 0
+
+        if n_jumps > 0:
+            # Each jump is log-normal
+            jump_sizes = self.rng.normal(self.mu_j, self.sigma_j, n_jumps)
+            log_return += np.sum(jump_sizes)
+
+        self.price *= np.exp(log_return)
+        self.step_count += 1
+        self._prices.append(self.price)
+        self._had_jump.append(had_jump)
+
+        # Realized vol includes both diffusive and jump variance
+        realized_vol = self._compute_realized_vol()
+        return self.price, realized_vol
+
+    def _compute_realized_vol(self, window: int = 20) -> float:
+        if len(self._prices) < 3:
+            return self.sigma
+        prices = np.array(self._prices[-min(window + 1, len(self._prices)):])
+        log_returns = np.diff(np.log(prices))
+        if len(log_returns) < 2:
+            return self.sigma
+        return float(np.std(log_returns) * np.sqrt(252))
+
+    def generate_path(self, n_steps: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generate complete price path with jump indicators.
+
+        Returns:
+            (prices, realized_vols, jump_flags)
+        """
+        self.reset()
+        prices = np.zeros(n_steps + 1)
+        vols = np.zeros(n_steps + 1)
+        jumps = np.zeros(n_steps + 1, dtype=bool)
+        prices[0] = self.S0
+        vols[0] = self.sigma
+
+        for i in range(n_steps):
+            price, vol = self.step()
+            prices[i + 1] = price
+            vols[i + 1] = vol
+            jumps[i + 1] = self._had_jump[-1]
+
+        return prices, vols, jumps
+
+    @property
+    def time(self) -> float:
+        return self.step_count * self.dt
+
 class VolRegimeSimulator:
     """
     Market simulator with regime-switching volatility.

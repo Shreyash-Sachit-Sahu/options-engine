@@ -1,0 +1,31 @@
+{
+  "DeltaHedger": {
+    "n_episodes": 44,
+    "mean_sharpe": 5.529391442470601,
+    "std_sharpe": 5.676297771833648,
+    "mean_pnl": 0.7082854998500749,
+    "std_pnl": 2.4608678119306377,
+    "sharpe_ratio": 4.56899134689412,
+    "mean_max_drawdown": 1.7574047641120571,
+    "max_max_drawdown": 10.457306568432202
+  },
+  "SAC": {
+    "n_episodes": 44,
+    "mean_sharpe": 2.6110691249625138,
+    "std_sharpe": 2.6178457010251495,
+    "mean_pnl": 9.533802345799725,
+    "std_pnl": 16.4706242647067,
+    "sharpe_ratio": 9.188748277037936,
+    "mean_max_drawdown": 12.053765964489152,
+    "max_max_drawdown": 79.77720328169013
+  },
+  "statistics": {
+    "t_stat": 3.475891024952724,
+    "p_value": 0.0011763590548491331,
+    "mean_pnl_diff": 8.825516845949648,
+    "ci_95_lo": 3.46803558977517,
+    "ci_95_hi": 13.315240379647012,
+    "significant_5pct": true,
+    "sharpe_outperformance_pct": 101.11108950303014
+  }
+}
