@@ -32,13 +32,124 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from agent.gpu_utils import get_device, device_banner, patch_sb3_device, \
     recommended_batch_size, recommended_buffer_size
 
+import torch
+import torch.nn as nn
 from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, BaseCallback
 )
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-from environment.options_env import OptionsHedgingEnv  # ← was missing
+from environment.options_env import OptionsHedgingEnv
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom PyTorch feature extractor (11-dim aware)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OptionsFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Custom neural network feature extractor for the 11-dim options obs space.
+
+    Why a custom extractor instead of SB3's default MLP?
+    The 11 features have very different scales and semantics:
+      - [0-1] price ratios        : near 1.0, tight range
+      - [2]   time fraction       : [0, 1] linear decay
+      - [3]   volatility          : [0.05, 0.5]
+      - [4]   delta               : [0, 1] sigmoid-shaped
+      - [5]   gamma × 100         : peaked near ATM, near zero OTM/ITM
+      - [6]   pnl                 : unbounded, clipped at ±10
+      - [7]   vega                : positive, peaked near ATM
+      - [8]   theta               : negative, grows in magnitude near expiry
+      - [9]   vol_carry           : ratio near 1.0 most of the time
+      - [10]  hedge_position      : [-1, 1] current state
+
+    LayerNorm after the first layer handles the scale differences without
+    relying entirely on VecNormalize. The two-tower structure separates
+    market state features (0-5) from portfolio state features (6-10),
+    then merges them — reflecting how options traders mentally partition
+    market vs position information.
+
+    Architecture:
+        Market tower  : [0-5]  → Linear(6, 64) → LayerNorm → ReLU
+        Portfolio tower: [6-10] → Linear(5, 32) → LayerNorm → ReLU
+        Merge         : cat(64, 32) → Linear(96, features_dim) → ReLU
+    """
+
+    def __init__(self, observation_space, features_dim: int = 128):
+        super().__init__(observation_space, features_dim)
+
+        # Market state: price ratios, time, vol, delta, gamma
+        self.market_tower = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+        )
+
+        # Portfolio state: pnl, vega, theta, vol_carry, hedge_pos
+        self.portfolio_tower = nn.Sequential(
+            nn.Linear(5, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+        )
+
+        # Merge
+        self.merge = nn.Sequential(
+            nn.Linear(96, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        market    = self.market_tower(obs[:, :6])
+        portfolio = self.portfolio_tower(obs[:, 6:])
+        return self.merge(torch.cat([market, portfolio], dim=1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gradient norm monitoring callback
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GradientMonitorCallback(BaseCallback):
+    """
+    Logs gradient norms for actor and critic networks to TensorBoard.
+
+    Why this matters: exploding or vanishing gradients are the most common
+    cause of SAC instability. Monitoring grad norm lets you catch this early
+    without waiting for the Sharpe to collapse.
+
+    Logs every 2000 steps under:
+        debug/actor_grad_norm
+        debug/critic_grad_norm
+        debug/total_grad_norm
+    """
+
+    def __init__(self, log_freq: int = 2000, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.log_freq != 0:
+            return True
+
+        policy = self.model.policy
+        actor_norm  = self._grad_norm(policy.actor.parameters())
+        critic_norm = self._grad_norm(policy.critic.parameters())
+        total_norm  = (actor_norm**2 + critic_norm**2) ** 0.5
+
+        self.logger.record("debug/actor_grad_norm",  actor_norm)
+        self.logger.record("debug/critic_grad_norm", critic_norm)
+        self.logger.record("debug/total_grad_norm",  total_norm)
+        return True
+
+    @staticmethod
+    def _grad_norm(params) -> float:
+        total = 0.0
+        for p in params:
+            if p.grad is not None:
+                total += p.grad.data.norm(2).item() ** 2
+        return total ** 0.5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,8 +513,15 @@ def train(args):
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── Model ────────────────────────────────────────────────────────────
-    policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
+    policy_kwargs = dict(
+        features_extractor_class=OptionsFeatureExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+        net_arch=dict(pi=[128, 64], qf=[128, 64]),  # smaller heads — extractor does heavy lifting
+    )
     ent_coef_auto = (args.ent_coef == "auto")
+    # Allow tune.py to inject best architecture via args.policy_kwargs
+    if hasattr(args, 'policy_kwargs') and args.policy_kwargs:
+        policy_kwargs = args.policy_kwargs
 
     model = SAC(
         "MlpPolicy",
@@ -475,6 +593,8 @@ def train(args):
     print(f"\n[START] Starting training...\n")
     start_time = time.time()
 
+    gradient_monitor = GradientMonitorCallback(log_freq=2000)
+
     model.learn(
         total_timesteps=args.total_timesteps,
         callback=[
@@ -482,6 +602,7 @@ def train(args):
             checkpoint_callback,
             sharpe_callback,
             dhp_callback,
+            gradient_monitor,
         ],
         progress_bar=True,
     )
@@ -577,13 +698,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train SAC hedging agent with dynamic HP control"
     )
-    parser.add_argument("--device", type=str, default="auto",
+    parser.add_argument("--device", type=str, default="cuda",
                         choices=["auto", "cuda", "mps", "cpu"],
                         help="Compute device: auto (default), cuda, mps, or cpu")
-    parser.add_argument("--total-timesteps", type=int, default=500_000)
-    parser.add_argument("--simulator", type=str, default="gbm",
+    parser.add_argument("--total-timesteps", type=int, default=1000000) 
+    parser.add_argument("--simulator", type=str, default="heston",
                         choices=["gbm", "heston", "jump"])
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4) 
     parser.add_argument("--lr-cycle-steps", type=int, default=100_000,
                         help="Steps per cosine annealing LR cycle")
     parser.add_argument("--buffer-size", type=int, default=200_000)

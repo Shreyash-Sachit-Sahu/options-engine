@@ -47,19 +47,19 @@ class OptionsHedgingEnv(gym.Env):
         [10] current_hedge     — current hedge position (memory)
 
     Action Space:
-        Box([-1], [1]) — delta adjustment
+        Box([-1], [1]) — residual delta correction
           The agent outputs a correction to the BS delta:
             target_hedge = clip(delta + 0.3 * action, -1, 1)
-          action =  0 -> pure delta hedge
+          action =  0 -> pure delta hedge (baseline)
           action =  1 -> over-hedge by 0.3
           action = -1 -> under-hedge by 0.3
+          This residual architecture lets the agent start from the
+          known-good delta hedge and focus learning on improvements.
 
-    Reward (5 components):
-        -0.1 * pnl^2          variance penalty
-        +0.02 * pnl           small PnL incentive
+    Reward:
+        -0.5 * pnl^2          variance penalty (hedging quality)
         -tc                   transaction cost
-        -0.5 * hedge_error    core: distance from BS delta
-        -0.01 * |dposition|   smooth trading bonus
+        -0.02 * |Δposition|   turnover penalty (skip unnecessary trades)
 
     Episode:
         30 trading days (option lifetime). Terminates early if
@@ -78,7 +78,7 @@ class OptionsHedgingEnv(gym.Env):
         sigma: float = 0.2,
         mu: float = 0.05,
         n_steps: int = 30,
-        transaction_cost: float = 0.001,
+        transaction_cost: float = 0.003,
         seed: Optional[int] = None,
         kappa: float = 2.0,
         theta: float = 0.04,
@@ -128,10 +128,10 @@ class OptionsHedgingEnv(gym.Env):
                 0.0,     # gamma (scaled)
                -np.inf,  # portfolio_pnl
                 0.0,     # vega
-               -np.inf,  # theta
+               -np.inf,  # theta (negative for long; positive for short — clipped)
                 0.0,     # vol_carry
                -1.0,     # current_hedge
-            ], dtype=np.float32),
+            ], dtype=np.float32),                                                   
             high=np.array([
                 5.0,     # S/S0
                 5.0,     # K/S0
@@ -141,7 +141,7 @@ class OptionsHedgingEnv(gym.Env):
                 np.inf,  # gamma (scaled)
                 np.inf,  # portfolio_pnl
                 np.inf,  # vega
-                0.0,     # theta (always <= 0 for long option; we short so positive)
+                np.inf,  # theta (positive — short call earns time decay) 
                 5.0,     # vol_carry
                 1.0,     # current_hedge
             ], dtype=np.float32),
@@ -206,10 +206,14 @@ class OptionsHedgingEnv(gym.Env):
         except Exception:
             delta = 0.5
 
-        # ── 2. Target hedge: agent directly sets hedge ratio ────────────
-        # Using delta + adjustment constrained the agent to replicate
-        # DeltaHedger. Raw action gives it freedom to find better strategies.
-        target_hedge = float(np.clip(action[0], -1.0, 1.0))
+        # ── 2. Target hedge: delta + RL correction (residual architecture) ─
+        # The agent learns corrections to BS delta rather than raw positions.
+        # This gives it the delta-hedge as an inductive bias (action=0 → delta)
+        # and focuses learning on the valuable part: when/how to deviate.
+        # At higher TC, the agent learns to skip rebalancing when delta
+        # hasn't moved much — the key edge over naive delta hedging.
+        rl_adjustment = float(action[0])   # in [-1, 1]
+        target_hedge = float(np.clip(delta + 0.3 * rl_adjustment, -1.0, 1.0))
 
         # ── 3. Transaction cost ───────────────────────────────────────────
         position_change = abs(target_hedge - self.hedge_position)
@@ -240,11 +244,13 @@ class OptionsHedgingEnv(gym.Env):
         self.pnl_history.append(total_pnl)
 
         # ── 6. Reward ──────────────────────────────────────────────────────
-        # Reward: minimise hedging variance + transaction costs.
-        # Kept simple and stable — complex reward shaping caused the agent
-        # to exploit the reward rather than learn genuine hedging.
-        reward  = -0.1 * (total_pnl ** 2)     # variance penalty
-        reward -= tc                           # transaction cost
+        # Reward: minimise hedging variance + penalise costly rebalancing.
+        # The turnover penalty teaches the agent to skip rebalancing when
+        # the position hasn't moved much — this is the key edge over delta
+        # hedging, which naively rebalances every step.
+        reward  = -0.5 * (total_pnl ** 2)              # variance penalty (stronger)
+        reward -= tc                                     # transaction cost
+        reward -= 0.02 * position_change                 # turnover penalty
 
         # ── 7. Termination ────────────────────────────────────────────────
         terminated = False
@@ -310,7 +316,7 @@ class OptionsHedgingEnv(gym.Env):
             gamma * 100.0,                  # scale gamma (typically 0.001–0.05)
             np.clip(pnl_normalised, -10, 10),
             vega,
-            np.clip(theta, -10.0, 0.0),     # theta always negative (short option)
+            np.clip(theta, 0.0, 10.0),      # theta always negative (short option)
             vol_carry,
             float(np.clip(self.hedge_position, -1.0, 1.0)),
         ], dtype=np.float32)

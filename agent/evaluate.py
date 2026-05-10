@@ -134,7 +134,7 @@ def bootstrap_sharpe_ci(pnls: np.ndarray, n_boot: int = 10_000,
     n = len(pnls)
     for _ in range(n_boot):
         sample = rng.choice(pnls, size=n, replace=True)
-        s = float(np.mean(sample) / (np.std(sample) + 1e-10) * np.sqrt(252))
+        s = float(np.mean(sample))  # sample is episode Sharpes — mean directly
         boot_sharpes.append(s)
     lo = (100 - ci) / 2
     return float(np.percentile(boot_sharpes, lo)), float(np.percentile(boot_sharpes, 100 - lo))
@@ -289,24 +289,36 @@ def run_full_evaluation(args):
     model_dir  = Path(args.model_path).parent
     vnorm_path = args.vnorm_path
 
+    _default_model_path = "agent/models/sac_hedger_final"
+
     def _resolve_model() -> str:
-        candidates = [
-            args.model_path,                                           # explicit
-            str(model_dir / f"best_{sim_tag}" / "best_model"),        # best checkpoint
-            str(model_dir / f"sac_hedger_{sim_tag}_final"),           # sim-tagged final
-            str(model_dir / "sac_hedger_final"),                       # generic fallback
+        # Only use explicit --model-path if the user actually changed it
+        # from the default. Otherwise, prefer the sim-tagged model.
+        user_explicit = args.model_path != _default_model_path
+        candidates = []
+        if user_explicit:
+            candidates.append(args.model_path)
+        candidates += [
+            str(model_dir / f"best_{sim_tag}" / "best_model"),   # best checkpoint
+            str(model_dir / f"sac_hedger_{sim_tag}_final"),       # sim-tagged final
         ]
+        if not user_explicit:
+            candidates.append(args.model_path)                    # generic last resort
         for c in candidates:
             if os.path.exists(c + ".zip") or os.path.exists(c):
                 return c
         return args.model_path   # will fail gracefully below
 
+    _default_vnorm_path = "agent/models/vec_normalize.pkl"
+
     def _resolve_vnorm() -> str:
-        candidates = [
-            args.vnorm_path,
-            str(model_dir / f"vec_normalize_{sim_tag}.pkl"),
-            str(model_dir / "vec_normalize.pkl"),
-        ]
+        user_explicit = args.vnorm_path != _default_vnorm_path
+        candidates = []
+        if user_explicit:
+            candidates.append(args.vnorm_path)
+        candidates.append(str(model_dir / f"vec_normalize_{sim_tag}.pkl"))
+        if not user_explicit:
+            candidates.append(args.vnorm_path)
         for c in candidates:
             if os.path.exists(c):
                 return c
@@ -316,6 +328,25 @@ def run_full_evaluation(args):
     vnorm_path = _resolve_vnorm()
     print(f"[MODEL] Loading: {model_path}")
     print(f"[VNORM] Loading: {vnorm_path}")
+
+    # Sanity check: warn if vnorm obs dim doesn't match current env
+    try:
+        import pickle
+        with open(vnorm_path, "rb") as _f:
+            _vn = pickle.load(_f)
+        _vnorm_dim = len(_vn.obs_rms.mean)
+        _env_dim   = 11  # current obs space after expansion
+        if _vnorm_dim != _env_dim:
+            sep = "=" * 70
+            print(f"\n{sep}")
+            print(f"  [CRITICAL] OBS DIMENSION MISMATCH")
+            print(f"  VecNormalize has {_vnorm_dim}-dim stats but env expects {_env_dim}-dim.")
+            print(f"  This model was trained BEFORE the obs space expansion.")
+            print(f"  Results will be UNRELIABLE. You must retrain:")
+            print(f"    python agent/train.py --simulator {sim_tag} --total-timesteps 500000")
+            print(f"{sep}\n")
+    except Exception:
+        pass
 
     if os.path.exists(model_path + ".zip") or os.path.exists(model_path):
         print(f"\n[SAC] Evaluating SAC agent...")
@@ -351,21 +382,21 @@ def run_full_evaluation(args):
               f"{r.get('mean_max_drawdown', 0):>10.4f} {pct_str:>10}")
 
     # ─── Bootstrap CI on SAC Sharpe ──────────────────────────────────────
-    if "SAC" in results and results["SAC"].get("episode_pnls"):
-        sac_pnls = np.array(results["SAC"]["episode_pnls"])
-        ci_lo, ci_hi = bootstrap_sharpe_ci(sac_pnls)
-        results["SAC"]["sharpe_ci_95"] = [ci_lo, ci_hi]
+    if "SAC" in results and results["SAC"].get("episode_sharpes"):
+        sac_sharpes = np.array(results["SAC"].get("episode_sharpes", []))   # ← add this line 
+        sac_pnls    = np.array(results["SAC"]["episode_pnls"])
+        ci_lo, ci_hi = bootstrap_sharpe_ci(sac_sharpes) if len(sac_sharpes) > 0 else (0.0, 0.0)
         print(f"\n[STATS] SAC Sharpe 95% CI (bootstrap, n=10k): "
               f"[{ci_lo:.3f}, {ci_hi:.3f}]")
 
         # Paired t-test vs delta
-        delta_pnls = np.array(results.get("DeltaHedger", {}).get("episode_pnls", []))
-        if len(delta_pnls) > 0:
-            stats = statistical_comparison(sac_pnls, delta_pnls)
+        delta_sharpes = np.array(results.get("DeltaHedger", {}).get("episode_sharpes", []))
+        if len(delta_sharpes) > 0 and len(sac_sharpes) > 0:
+            stats = statistical_comparison(sac_sharpes, delta_sharpes)
             results["statistics"] = stats
             sig = "YES ✓" if stats["significant_5pct"] else "NO ✗"
             print(f"[STATS] SAC vs Delta paired t-test:")
-            print(f"   Mean PnL diff : {stats['mean_diff']:+.6f}")
+            print(f"   Mean Sharpe diff : {stats['mean_diff']:+.6f}")
             print(f"   95% CI        : [{stats['ci_95_lo']:+.6f}, {stats['ci_95_hi']:+.6f}]")
             print(f"   p-value       : {stats['p_value']:.4f}  (significant: {sig})")
 
@@ -373,11 +404,11 @@ def run_full_evaluation(args):
     if "SAC" in results and not args.skip_tc_sweep:
         print(f"\n[TC SWEEP] Analysing TC sensitivity...")
         try:
-            model_path = args.model_path
+            resolved_path = _resolve_model()
             device = get_device(verbose=False)
-            model = SAC.load(model_path, device=device)
+            model = SAC.load(resolved_path, device=device)
             tc_results = transaction_cost_sweep(
-                model, args.vnorm_path, env_config,
+                model, _resolve_vnorm(), env_config,
                 tc_levels=[0.0, 0.0005, 0.001, 0.002, 0.003, 0.005],
                 n_episodes=200,
             )

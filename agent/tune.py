@@ -45,6 +45,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from environment.options_env import OptionsHedgingEnv
 from agent.gpu_utils import get_device, patch_sb3_device, device_banner
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from agent.train import OptionsFeatureExtractor
 
 warnings.filterwarnings("ignore")
 
@@ -205,7 +207,11 @@ def make_objective(base_env_config: dict, n_train_steps: int,
                                                      [500, 1000, 2000])
 
         arch = [net_width] * net_depth
-        policy_kwargs = dict(net_arch=dict(pi=arch, qf=arch))
+        policy_kwargs = dict(
+            features_extractor_class=OptionsFeatureExtractor,
+            features_extractor_kwargs=dict(features_dim=128), # 11 inputs → 128 features
+            net_arch=dict(pi=arch, qf=arch),
+        )
 
         # ── Training envs (TuningEnv — no early termination) ─────────────
         train_env = DummyVecEnv(
@@ -283,7 +289,7 @@ def run_tuning(args):
         "sigma": 0.2,
         "mu": 0.05,
         "n_steps": 30,
-        "transaction_cost": 0.001,
+        "transaction_cost": 0.003,
     }
     if args.simulator == "heston":
         base_env_config.update({
@@ -437,14 +443,11 @@ def _launch_full_train(args, params, device: str):
     )
 
     arch = [params["net_width"]] * params["net_depth"]
-    _orig_sac = train_module.SAC
-
-    class PatchedSAC(_orig_sac):
-        def __init__(self, policy, env, **kwargs):
-            kwargs["policy_kwargs"] = dict(net_arch=dict(pi=arch, qf=arch))
-            super().__init__(policy, env, **kwargs)
-
-    train_module.SAC = PatchedSAC
+    train_args.policy_kwargs = dict(
+        features_extractor_class=OptionsFeatureExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+        net_arch=dict(pi=arch, qf=arch),
+    )
     train_module.train(train_args)
 
 

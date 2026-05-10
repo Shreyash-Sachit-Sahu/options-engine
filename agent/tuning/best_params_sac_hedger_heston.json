@@ -1,20 +1,20 @@
 {
   "study_name": "sac_hedger_heston",
-  "best_trial": 22,
-  "best_sharpe_proxy": 9.166269362559943,
+  "best_trial": 80,
+  "best_sharpe_proxy": 14.012894665370794,
   "params": {
-    "lr": 0.00013077490840977574,
-    "batch_size": 64,
-    "buffer_size": 50000,
-    "tau": 0.002539862191622342,
-    "gamma": 0.9992756793652049,
-    "net_width": 128,
+    "lr": 0.000410059353878552,
+    "batch_size": 128,
+    "buffer_size": 200000,
+    "tau": 0.0010146205328861874,
+    "gamma": 0.9924740975257274,
+    "net_width": 64,
     "net_depth": 2,
-    "ent_coef": 0.01,
-    "learning_starts": 2000
+    "ent_coef": 0.05,
+    "learning_starts": 1000
   },
   "arch": [
-    128,
-    128
+    64,
+    64
   ]
 }

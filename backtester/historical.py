@@ -102,7 +102,8 @@ class HistoricalBacktester:
         self.T_days = T_days
         self.tc_rate = transaction_cost
 
-    def run_episode(self, agent, start_idx: int = 0) -> dict:
+    def run_episode(self, agent, start_idx: int = 0,
+                    residual_action: bool = False) -> dict:
         """
         Run a single backtest episode starting from start_idx.
 
@@ -117,11 +118,13 @@ class HistoricalBacktester:
             raise ValueError("Not enough data for a full episode")
 
         S0 = self.prices[start_idx]
+        K = S0  # ATM strike per episode — avoids deep OTM/ITM premium explosion
         T = self.T_days / 252
 
         # Initial option premium — normalised to training-env scale (S0=100)
         scale = 100.0 / S0
-        premium = bs_call(S0, self.K, T, self.r, self.sigma) * scale
+        premium = bs_call(S0, K, T, self.r, self.sigma) * scale
+        premium = max(premium, 0.5)  # floor: prevents division explosion on near-zero OTM premiums
         portfolio_value = premium
         hedge_position = 0.0
 
@@ -150,7 +153,7 @@ class HistoricalBacktester:
 
             # Compute Greeks
             try:
-                g = greeks_call(price, self.K, T_remaining, self.r, realized_vol)
+                g = greeks_call(price, K, T_remaining, self.r, realized_vol)
                 delta = g.delta
                 gamma = g.gamma
             except:
@@ -164,8 +167,8 @@ class HistoricalBacktester:
             vol_carry = float(np.clip(realized_vol / max(self.sigma, 1e-6), 0.0, 5.0))
 
             try:
-                vega  = float(greeks_call(price, self.K, T_remaining, self.r, realized_vol).vega)
-                theta = float(greeks_call(price, self.K, T_remaining, self.r, realized_vol).theta)
+                vega  = float(greeks_call(price, K, T_remaining, self.r, realized_vol).vega)
+                theta = float(greeks_call(price, K, T_remaining, self.r, realized_vol).theta)
             except Exception:
                 vega, theta = 0.0, 0.0
 
@@ -177,21 +180,28 @@ class HistoricalBacktester:
             norm_factor = S0 / 100.0
             obs = np.array([
                 price / S0,
-                self.K / S0,
+                K / S0,
                 T_remaining / T,
                 realized_vol,
                 delta,                                      # dimensionless [0,1]
                 (gamma * 100.0) / norm_factor,              # gamma scales with 1/S
                 np.clip(pnl_norm, -10, 10),
                 vega       / norm_factor,                   # vega scales with S
-                np.clip(theta / norm_factor, -10.0, 0.0),  # theta scales with S
+                np.clip(-theta / norm_factor, 0.0, 10.0),  # negate: short call earns theta decay (matches options_env._get_obs)
                 vol_carry,                                  # dimensionless ratio
                 float(np.clip(hedge_position, -1.0, 1.0)), # dimensionless [-1,1]
             ], dtype=np.float32)
 
             # Get action
             action, _ = agent.predict(obs)
-            target_hedge = float(np.clip(action[0], -1.0, 1.0))
+            action, _ = agent.predict(obs)
+            if residual_action:
+                # SAC trained with residual architecture:
+                # output is a correction to delta, NOT an absolute hedge.
+                # Without this, action=-0.2 means "short 20%" not "reduce by 6%"
+                target_hedge = float(np.clip(delta + 0.3 * float(action[0]), -1.0, 1.0))
+            else:
+                target_hedge = float(np.clip(action[0], -1.0, 1.0))
 
             # Transaction cost
             tc = self.tc_rate * abs(target_hedge - hedge_position) * (price * 100.0 / S0)
@@ -223,8 +233,8 @@ class HistoricalBacktester:
             # Normalise option prices to training-env scale (S0=100)
             # so option_pnl and hedge_pnl are in the same units
             scale = 100.0 / S0
-            old_opt = bs_call(price,      self.K, T_remaining, self.r, realized_vol) * scale
-            new_opt = bs_call(next_price, self.K, T_next,      self.r, realized_vol) * scale
+            old_opt = bs_call(price,      K, T_remaining, self.r, realized_vol) * scale
+            new_opt = bs_call(next_price, K, T_next,      self.r, realized_vol) * scale
             option_pnl = -(new_opt - old_opt)
 
             total_pnl = hedge_pnl + option_pnl
@@ -235,7 +245,7 @@ class HistoricalBacktester:
 
         # Final settlement
         final_price = self.prices[start_idx + self.T_days]
-        intrinsic = max(final_price - self.K, 0.0) * scale
+        intrinsic = max(final_price - K, 0.0) * scale
         portfolio_value -= intrinsic
 
         pnls = np.array(pnl_history)
@@ -247,10 +257,10 @@ class HistoricalBacktester:
         total_pnl_norm = float(np.sum(pnls_norm))
 
         # Sharpe on normalised daily PnL, annualised
+        # Information ratio across 30 steps (not annualised)
         sharpe = float(
-            np.mean(pnls_norm) / (np.std(pnls_norm) + 1e-10) * np.sqrt(252)
+            np.mean(pnls_norm) / (np.std(pnls_norm) + 1e-10)
         )
-
         # Max drawdown on normalised cumulative PnL
         cum_pnl = np.cumsum(pnls_norm)
         running_max = np.maximum.accumulate(cum_pnl)
@@ -275,7 +285,8 @@ class HistoricalBacktester:
             ) / max(premium, 1e-6),   # also normalised
         }
 
-    def run_backtest(self, agent, stride: int = 5) -> dict:
+    def run_backtest(self, agent, stride: int = 5,
+                     residual_action: bool = False) -> dict:
         """
         Run rolling backtests across the full price history.
 
@@ -293,7 +304,8 @@ class HistoricalBacktester:
         episodes = []
         for start in range(0, n_possible, stride):
             try:
-                result = self.run_episode(agent, start_idx=start)
+                result = self.run_episode(agent, start_idx=start,
+                                          residual_action=residual_action)
                 episodes.append(result)
             except Exception as e:
                 continue
@@ -311,10 +323,10 @@ class HistoricalBacktester:
             "std_sharpe": float(np.std(sharpes)),
             "mean_pnl": float(np.mean(pnls)),
             "std_pnl": float(np.std(pnls)),
-            "sharpe_ratio": float(
-                np.mean(pnls) / (np.std(pnls) + 1e-10) * np.sqrt(252)
-            ),
-            "mean_max_drawdown": float(np.mean(drawdowns)),
+            "sharpe_ratio": float(np.mean(sharpes)),  # mean of per-episode Sharpes (correct)
+            "sharpe_ratio_cross_ep": float(
+                np.mean(pnls) / (np.std(pnls) + 1e-10)
+            ),  # cross-episode Sharpe (biased by S0 variation — for reference only)
             "max_max_drawdown": float(np.max(drawdowns)),
             "episodes": episodes,
         }
@@ -389,6 +401,23 @@ if __name__ == "__main__":
     model_zip = args.model_path + ".zip"
     if Path(args.model_path).exists() or Path(model_zip).exists():
         print(f"\n[SAC] Loading model from {args.model_path}...")
+
+        # Warn if VecNormalize dim doesn't match 11-dim obs space
+        try:
+            import pickle as _pkl
+            with open(args.vnorm_path, "rb") as _f:
+                _vn_check = _pkl.load(_f)
+            _dim = len(_vn_check.obs_rms.mean)
+            if _dim != 11:
+                print(f"\n{'='*65}")
+                print(f"  [CRITICAL] OBS MISMATCH: VecNormalize is {_dim}-dim, env is 11-dim.")
+                print(f"  This model was trained BEFORE the obs space expansion.")
+                print(f"  Results will be INVALID. Retrain first:")
+                print(f"    train_all.bat   (or: python agent/train.py --simulator heston)")
+                print(f"{'='*65}\n")
+        except Exception:
+            pass
+
         try:
             from stable_baselines3 import SAC
             from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -444,7 +473,8 @@ if __name__ == "__main__":
 
             sac_agent = SACAgent(sac_model, args.vnorm_path)
             print(f"[SAC] Running SAC backtest on same real SPY paths...")
-            sac_results = bt.run_backtest(sac_agent, stride=args.stride)
+            sac_results = bt.run_backtest(sac_agent, stride=args.stride,
+                                              residual_action=True)
             all_results["SAC"] = sac_results
             print(f"  Episodes : {sac_results['n_episodes']}")
             print(f"  Sharpe   : {sac_results['sharpe_ratio']:.4f}")
