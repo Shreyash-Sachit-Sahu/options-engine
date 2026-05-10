@@ -1,31 +1,31 @@
 {
   "DeltaHedger": {
     "n_episodes": 44,
-    "mean_sharpe": 0.1962969175199383,
-    "std_sharpe": 0.3098529866806805,
-    "mean_pnl": 0.08792395830140533,
-    "std_pnl": 0.11363992770396983,
-    "sharpe_ratio": 0.1962969175199383,
-    "sharpe_ratio_cross_ep": 0.7737065659974297,
-    "max_max_drawdown": 0.4077136628437742
+    "mean_sharpe": 0.19629784641857226,
+    "std_sharpe": 0.3098529344250215,
+    "mean_pnl": 0.08792403116899618,
+    "std_pnl": 0.1136399114537831,
+    "sharpe_ratio": 0.19629784641857226,
+    "sharpe_ratio_cross_ep": 0.7737073178500654,
+    "max_max_drawdown": 0.4077119422443607
   },
   "SAC": {
     "n_episodes": 44,
-    "mean_sharpe": 0.29872313332404626,
-    "std_sharpe": 0.44164111881277945,
-    "mean_pnl": 0.2066954384708248,
-    "std_pnl": 0.19796008249976968,
-    "sharpe_ratio": 0.29872313332404626,
-    "sharpe_ratio_cross_ep": 1.0441268550524705,
-    "max_max_drawdown": 0.5383684784414358
+    "mean_sharpe": 0.29079978866512224,
+    "std_sharpe": 0.4306077413638095,
+    "mean_pnl": 0.1498945629803483,
+    "std_pnl": 0.14486003419448767,
+    "sharpe_ratio": 0.29079978866512224,
+    "sharpe_ratio_cross_ep": 1.0347544352752662,
+    "max_max_drawdown": 0.4418105496262351
   },
   "statistics": {
-    "t_stat": 5.360949429388285,
-    "p_value": 3.080407041128632e-06,
-    "mean_pnl_diff": 0.11877148016941948,
-    "ci_95_lo": 0.0753386357354723,
-    "ci_95_hi": 0.16002436631750097,
+    "t_stat": 4.834863289313934,
+    "p_value": 1.7352579569358125e-05,
+    "mean_pnl_diff": 0.06197053181135215,
+    "ci_95_lo": 0.037700058143610854,
+    "ci_95_hi": 0.08741029483807954,
     "significant_5pct": true,
-    "sharpe_outperformance_pct": 52.179227823943954
+    "sharpe_outperformance_pct": 48.14211870926002
   }
 }
