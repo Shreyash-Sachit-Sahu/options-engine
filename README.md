@@ -34,7 +34,7 @@ Tested on real SPY price data (May 2024 – May 2026), covering the April 2025 t
 │                   Streamlit Dashboard                    │
 │  Vol Surface │ Greeks │ PnL Charts │ Agent Comparison   │
 └──────────────────────────┬──────────────────────────────┘
-                           │
+                           │ HTTP (FastAPI)
 ┌──────────────────────────▼──────────────────────────────┐
 │                    FastAPI Backend                        │
 │  /price  /greeks  /iv  /agent/action  /benchmark        │
@@ -58,6 +58,8 @@ Tested on real SPY price data (May 2024 – May 2026), covering the April 2025 t
                                │  • Transaction costs      │
                                └───────────────────────────┘
 ```
+
+The dashboard calls the FastAPI backend for all pricing, Greeks, and agent inference. The API falls back to Python pricing if the C++ pricer is not compiled.
 
 ## 🚀 Quick Start
 
@@ -86,6 +88,7 @@ Training automatically uses the best available device — **CUDA → MPS → CPU
 
 ```bash
 python agent/gpu_utils.py
+python agent/gpu_utils.py --bench   # matmul speedup vs CPU
 ```
 
 If CUDA is not detected, reinstall PyTorch with CUDA support:
@@ -142,16 +145,18 @@ python backtester/historical.py \
   --period 2y --stride 3
 ```
 
-### 9. Launch Dashboard
-```bash
-streamlit run dashboard/app.py
-```
-
-### 10. Start API (Optional)
+### 9. Start API
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 # Interactive docs: http://localhost:8000/docs
 ```
+
+### 10. Launch Dashboard
+```bash
+streamlit run dashboard/app.py
+```
+
+The dashboard connects to the API at `http://localhost:8000` by default. The URL is configurable in the sidebar — change it to any deployed API endpoint for remote access. All pricing, Greeks, and agent inference go through the API with automatic local fallback if offline.
 
 ## 📋 Recommended Full Workflow
 
@@ -194,11 +199,6 @@ tune.py (50+ trials)  →  train.py (Heston, 1M steps)  →  evaluate.py  →  h
 | 8–15 GB | 512 | 500k |
 | 16 GB+ | 1024 | 1M |
 
-```bash
-python agent/gpu_utils.py          # diagnostics
-python agent/gpu_utils.py --bench  # matmul benchmark
-```
-
 ## 📁 Project Structure
 
 ```
@@ -216,8 +216,8 @@ options-engine/
 ├── backtester/
 │   ├── historical.py      # Real SPY replay — SAC vs Delta + significance tests
 │   └── vol_surface.py     # Live IV surface from yfinance
-├── dashboard/app.py       # Streamlit dashboard (6 panels)
-├── api/main.py            # FastAPI backend (optional)
+├── dashboard/app.py       # Streamlit dashboard — calls FastAPI backend
+├── api/main.py            # FastAPI backend (pricing + Greeks + agent inference)
 └── tests/                 # 70 tests, all passing
 ```
 
@@ -237,6 +237,22 @@ options-engine/
 | `ent_coef` | 0.05 | auto / 0.01 / 0.05 / 0.1 / 0.5 |
 
 Dynamic HP control during training: cosine annealing LR (SGDR), Sharpe-driven entropy, critic-stability-driven gradient steps. All logged to TensorBoard under `dynamic_hp/`.
+
+## ⚠️ Known Limitations
+
+These are honest constraints worth understanding before drawing conclusions from the results.
+
+**Training data is entirely synthetic.** The agent was trained on Heston stochastic vol simulations, not real market data. The Heston parameters (κ=2.0, θ=0.04, ξ=0.3, ρ=−0.7) are calibrated to typical US equity dynamics but do not capture all real-world microstructure effects such as volatility jumps, liquidity gaps, or intraday patterns.
+
+**Real-data backtest uses simplified market assumptions.** The historical backtester uses ATM options (K = spot at episode start), a fixed risk-free rate (r=0.05), and realized vol as a proxy for implied vol. In practice, IV can diverge significantly from realized vol — especially during stress events — and real hedging would use actual IV from the options chain. The April 2025 tariff crash episodes are included but the agent was never trained on any real price data.
+
+**Transaction cost is fixed.** The TC rate (0.003) is constant across all episodes. Real bid-ask spreads are dynamic, wider in volatile periods, and volume-dependent. The TC sensitivity sweep shows the agent beats delta hedging across all tested TC levels (0 to 0.005), but this does not account for market impact.
+
+**Strike selection is ATM only.** Using K = S0 per episode avoids the deep-OTM premium explosion problem but means the agent was only evaluated on at-the-money options. Performance on skewed or term-structure trades is untested.
+
+**No live trading.** This is a research and backtesting system. It has not been tested in a paper trading or live execution environment. Past backtest performance does not guarantee future results.
+
+**Simulated Sharpe of 13.96 during training is not a result.** This is the peak rolling mean of within-episode information ratios computed over 30-step training episodes on the Heston simulator — a relative signal used by the dynamic HP controller, not an out-of-sample metric. The credible results are the out-of-sample numbers: Sharpe 2.75 on 500 held-out Heston episodes and Sharpe 0.29 on 1 year of real SPY data.
 
 ## 🧪 Testing
 
@@ -258,7 +274,7 @@ python -m pytest tests/ --cov=src --cov=environment --cov=api -v
 | Market Simulation | GBM · Heston SV · Merton Jump-Diffusion |
 | Statistical Validation | Bootstrap CI · Paired t-test · TC sensitivity |
 | Historical Validation | Real SPY data (2024–2026) via yfinance |
-| Dashboard | Streamlit, Plotly |
+| Dashboard | Streamlit, Plotly (API-connected) |
 | API | FastAPI, uvicorn |
 | CI/CD | GitHub Actions |
 
@@ -268,14 +284,16 @@ python -m pytest tests/ --cov=src --cov=environment --cov=api -v
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
+Visit `http://localhost:8000/docs` for interactive Swagger UI.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/price` | BSM or MC option pricing |
 | `POST` | `/greeks` | Full Greeks computation |
 | `POST` | `/iv` | Implied volatility solver |
-| `POST` | `/agent/action` | SAC agent inference |
-| `GET` | `/benchmark` | Run pricing benchmark |
-| `GET` | `/health` | Health check |
+| `POST` | `/agent/action` | SAC agent inference (11-dim obs) |
+| `GET` | `/benchmark` | Run C++ pricing benchmark |
+| `GET` | `/health` | Health check + model status |
 
 ## 📜 License
 
