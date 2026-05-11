@@ -111,8 +111,8 @@ class IVResponse(BaseModel):
 
 class AgentActionRequest(BaseModel):
     observation: list = Field(
-        ..., min_length=7, max_length=7,
-        description="7-dim observation: [S/S0, K/S0, T_rem/T, sigma, delta, gamma, pnl]"
+        ..., min_length=11, max_length=11,
+        description="11-dim observation: [S/S0, K/S0, T_rem/T, sigma, delta, gamma*100, pnl, vega, theta, vol_carry, hedge_pos]"
     )
 
 class AgentActionResponse(BaseModel):
@@ -128,11 +128,35 @@ _sac_model = None
 def get_sac_model():
     global _sac_model
     if _sac_model is None:
-        model_path = Path(__file__).parent.parent / "agent" / "models" / "sac_hedger_final.zip"
+        # Prefer best Heston checkpoint — most validated model
+        candidates = [
+            Path(__file__).parent.parent / "agent" / "models" / "best_heston" / "best_model.zip",
+            Path(__file__).parent.parent / "agent" / "models" / "sac_hedger_heston_final.zip",
+            Path(__file__).parent.parent / "agent" / "models" / "sac_hedger_final.zip",
+        ]
+        model_path = next((p for p in candidates if p.exists()), candidates[-1])
         if model_path.exists():
             from stable_baselines3 import SAC
+            from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+            from environment.options_env import OptionsHedgingEnv
             _sac_model = SAC.load(str(model_path))
-            print(f"✅ Loaded SAC model from {model_path}")
+            # Load VecNormalize stats
+            vnorm_candidates = [
+                model_path.parent.parent / "vec_normalize_heston.pkl",
+                model_path.parent / "vec_normalize_heston.pkl",
+                model_path.parent.parent / "vec_normalize.pkl",
+            ]
+            vnorm_path = next((p for p in vnorm_candidates if p.exists()), None)
+            if vnorm_path:
+                dummy = DummyVecEnv([lambda: OptionsHedgingEnv()])
+                vn = VecNormalize.load(str(vnorm_path), dummy)
+                vn.training = False
+                vn.norm_reward = False
+                _sac_model._vnorm = vn
+                print(f"✅ Loaded SAC model + VecNormalize from {model_path}")
+            else:
+                _sac_model._vnorm = None
+                print(f"✅ Loaded SAC model from {model_path} (no VecNormalize)")
         else:
             print(f"⚠️  No SAC model found at {model_path}")
             return None
@@ -244,6 +268,8 @@ async def agent_action(req: AgentActionRequest):
 
     try:
         obs = np.array(req.observation, dtype=np.float32).reshape(1, -1)
+        if hasattr(model, '_vnorm') and model._vnorm is not None:
+            obs = model._vnorm.normalize_obs(obs)
         action, _ = model.predict(obs, deterministic=True)
         latency = (time.perf_counter() - start) * 1000
 
