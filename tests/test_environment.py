@@ -82,13 +82,13 @@ class TestOptionsEnv:
 
     def test_env_creation(self):
         env = OptionsHedgingEnv(seed=42)
-        assert env.observation_space.shape == (7,)
+        assert env.observation_space.shape == (11,)
         assert env.action_space.shape == (1,)
 
     def test_env_reset(self):
         env = OptionsHedgingEnv(seed=42)
         obs, info = env.reset()
-        assert obs.shape == (7,)
+        assert obs.shape == (11,)
         assert isinstance(info, dict)
 
     def test_observation_in_bounds(self):
@@ -106,7 +106,7 @@ class TestOptionsEnv:
 
         obs, reward, terminated, truncated, info = env.step(action)
 
-        assert obs.shape == (7,)
+        assert obs.shape == (11,)
         assert isinstance(reward, float)
         assert isinstance(terminated, bool)
         assert isinstance(truncated, bool)
@@ -148,7 +148,7 @@ class TestOptionsEnv:
 
         # Large action should be clipped
         obs, _, _, _, _ = env.step(np.array([5.0], dtype=np.float32))
-        assert obs.shape == (7,)  # Should not crash
+        assert obs.shape == (11,)  # Should not crash
 
     def test_heston_env(self):
         """Environment works with Heston simulator."""
