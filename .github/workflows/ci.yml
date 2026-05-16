@@ -192,7 +192,10 @@ jobs:
               (HestonSimulator, 'Heston', {'v0': 0.04, 'kappa': 2.0, 'theta': 0.04, 'xi': 0.3, 'rho': -0.7}),
               (MertonJumpDiffusionSimulator, 'Jump', {'lam': 1.0, 'mu_j': -0.1, 'sigma_j': 0.15}),
           ]:
-              sim = SimClass(S0=100.0, mu=0.05, sigma=0.2, seed=42, **kwargs)
+              base = {'S0': 100.0, 'mu': 0.05, 'seed': 42}
+              if 'v0' not in kwargs:  # GBM and Jump take sigma
+                  base['sigma'] = 0.2
+              sim = SimClass(**base, **kwargs)
               sim.reset()
               prices = [100.0]
               for _ in range(30):
