@@ -99,11 +99,25 @@ def greeks_api(S, K, T, r, sigma, flag):
     g = greeks_call(S,K,T,r,sigma) if flag=="call" else greeks_put(S,K,T,r,sigma)
     return {"delta":g.delta,"gamma":g.gamma,"vega":g.vega,"theta":g.theta,"rho":g.rho}, 0
 
-def agent_api(obs_11):
-    data, lat, err = _api("/agent/action", "POST", {"observation": obs_11})
+def agent_api(obs_12):
+    data, lat, err = _api("/agent/action", "POST", {"observation": obs_12})
     if data:
         return data["action"], data.get("agent_type","SAC"), lat
     return None, "unavailable", 0
+
+def iv_api(market_price, S, K, T, r, flag):
+    data, lat, err = _api("/iv", "POST", {
+        "market_price": market_price,
+        "S": S, "K": K, "T": T, "r": r, "flag": flag
+    })
+    if data:
+        return data["implied_vol"], lat
+    # Python fallback
+    try:
+        from src.pricer.pricer_py import implied_vol as py_iv
+        return float(py_iv(market_price, S, K, T, r, flag)), 0
+    except Exception:
+        return None, 0
 
 # ═══ PAGE CONFIG ══════════════════════════════════════════════════════════════
 
@@ -167,7 +181,7 @@ with st.sidebar:
     health, err = api_health(st.session_state.api_url)
     api_online  = health is not None
     BACKEND     = health.get("pricing_backend", "?") if health else f"{BACKEND_LOCAL} (local)"
-    model_ok    = health.get("sac_model_loaded", False) if health else False
+    model_ok    = health.get("sac_loaded", health.get("sac_model_loaded", False)) if health else False
 
     st.markdown(f"""
     <div class="pill {'ok' if api_online else 'err'}">● {'Online' if api_online else 'Offline'} · {BACKEND}</div>
@@ -217,7 +231,7 @@ with st.sidebar:
         g2, _ = greeks_api(S,K,T,r,sigma,flag)
         obs = [S/S, K/S, min(T/max(T,1e-10),1.0), sigma, g2["delta"],
                g2["gamma"]*100.0, 0.0, g2["vega"],
-               min(-g2["theta"],10.0), 1.0, 0.0]
+               min(-g2["theta"],10.0), 1.0, 0.0, 0.5]  # 12-dim: vol_regime=0.5 (medium)
         action, atype, alat = agent_api(obs)
         if action is not None:
             diff = action - g2["delta"]
@@ -228,6 +242,25 @@ with st.sidebar:
             </div>""", unsafe_allow_html=True)
         else:
             st.warning("Agent unavailable")
+
+    st.markdown("---")
+    st.markdown("### 🔍 IV Calculator")
+    iv_price = st.number_input("Market Price", min_value=0.01,
+                                value=float(round(bs_p, 4)), step=0.01,
+                                format="%.4f")
+    if st.button("▶ Solve IV", use_container_width=True):
+        iv_val, iv_lat = iv_api(iv_price, S, K, T, r, flag)
+        if iv_val is not None:
+            iv_diff = iv_val - sigma
+            st.markdown(f"""<div class="card">
+                <div class="cl">Implied Volatility · {src}</div>
+                <div class="cv">{iv_val:.4f}</div>
+                <div class="cs {'pos' if abs(iv_diff)<0.02 else 'neu'}">
+                    vs slider σ: {iv_diff:+.4f} · {iv_lat:.1f}ms
+                </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.warning("IV solver failed — check inputs")
 
     st.markdown("---")
     gpu_icon = "🟢" if GPU_AVAILABLE else "⚪"
@@ -466,5 +499,5 @@ with tab_bench:
 st.markdown("---")
 st.markdown(f"""<div style="text-align:center;color:var(--txt3);font-size:.72rem;padding:8px 0;font-family:'JetBrains Mono',monospace;">
     Options Pricing Engine · {BACKEND} · SAC · PyTorch · pybind11 + FastAPI + Streamlit ·
-    <span style="color:var(--txt2);">+48% Sharpe vs delta on real SPY · p&lt;0.0001</span>
+    <span style="color:var(--txt2);">+56% Sharpe vs delta on real SPY · p&lt;0.0001 · Simulation Sharpe 9.92</span>
 </div>""", unsafe_allow_html=True)

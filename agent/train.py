@@ -43,18 +43,20 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from environment.options_env import OptionsHedgingEnv
-
+from typing import cast
+import glob
+import re
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom PyTorch feature extractor (11-dim aware)
+# Custom PyTorch feature extractor (12-dim obs space)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OptionsFeatureExtractor(BaseFeaturesExtractor):
     """
-    Custom neural network feature extractor for the 11-dim options obs space.
+    Custom neural network feature extractor for the 12-dim options obs space.
 
     Why a custom extractor instead of SB3's default MLP?
-    The 11 features have very different scales and semantics:
+    The 12 features have very different scales and semantics:
       - [0-1] price ratios        : near 1.0, tight range
       - [2]   time fraction       : [0, 1] linear decay
       - [3]   volatility          : [0.05, 0.5]
@@ -65,17 +67,18 @@ class OptionsFeatureExtractor(BaseFeaturesExtractor):
       - [8]   theta               : negative, grows in magnitude near expiry
       - [9]   vol_carry           : ratio near 1.0 most of the time
       - [10]  hedge_position      : [-1, 1] current state
+      - [11]  vol_regime          : 0.0=low / 0.5=medium / 1.0=high
 
     LayerNorm after the first layer handles the scale differences without
     relying entirely on VecNormalize. The two-tower structure separates
-    market state features (0-5) from portfolio state features (6-10),
+    market state features (0-5) from portfolio state features (6-11),
     then merges them — reflecting how options traders mentally partition
     market vs position information.
 
     Architecture:
-        Market tower  : [0-5]  → Linear(6, 64) → LayerNorm → ReLU
-        Portfolio tower: [6-10] → Linear(5, 32) → LayerNorm → ReLU
-        Merge         : cat(64, 32) → Linear(96, features_dim) → ReLU
+        Market tower   : [0-5]  → Linear(6, 64) → LayerNorm → ReLU
+        Portfolio tower: [6-11] → Linear(6, 32) → LayerNorm → ReLU
+        Merge          : cat(64, 32) → Linear(96, features_dim) → ReLU
     """
 
     def __init__(self, observation_space, features_dim: int = 128):
@@ -88,9 +91,9 @@ class OptionsFeatureExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
         )
 
-        # Portfolio state: pnl, vega, theta, vol_carry, hedge_pos
+        # Portfolio state: pnl, vega, theta, vol_carry, hedge_pos, vol_regime
         self.portfolio_tower = nn.Sequential(
-            nn.Linear(5, 32),
+            nn.Linear(6, 32),
             nn.LayerNorm(32),
             nn.ReLU(),
         )
@@ -153,7 +156,7 @@ class GradientMonitorCallback(BaseCallback):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging callback (unchanged from original)
+# Logging callback
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SharpeLogCallback(BaseCallback):
@@ -190,36 +193,15 @@ class DynamicHPController(BaseCallback):
     performance signals. Three independent controllers run in parallel:
 
     1. Learning Rate — cosine annealing with warm restarts (SGDR).
-       Gradually decays lr from base → min, then restarts. Helps escape
-       local optima and fine-tunes in later training.
-
     2. Entropy Coefficient — responds to Sharpe trend.
-       Plateau/regression → boost ent_coef to explore more.
-       Steady improvement → reduce ent_coef to exploit.
-       Only fires when ent_coef is NOT "auto" (auto manages itself).
-
     3. Gradient Steps — responds to critic loss stability.
-       High critic loss variance → reduce gradient_steps (stabilise).
-       Low critic loss variance + decent Sharpe → increase gradient_steps
-       (extract more signal per batch of experience).
-
-    All changes are logged to TensorBoard under "dynamic_hp/".
-
-    Args:
-        base_lr          : Initial learning rate (from model config)
-        min_lr           : Floor for cosine annealing (default: base_lr / 10)
-        lr_cycle_steps   : Steps per cosine cycle
-        window           : Episode window for rolling Sharpe
-        sharpe_patience  : Episodes without improvement before entropy boost
-        ent_coef_auto    : Whether ent_coef="auto" (skip manual ent control)
-        verbose          : Print HP changes to stdout
     """
 
     def __init__(
         self,
-        base_lr: float = 3e-4,
-        min_lr: float = None,
-        lr_cycle_steps: int = 100_000,
+        base_lr: float = 1e-4,
+        min_lr: float | None = None,
+        lr_cycle_steps: int = 500_000,
         window: int = 50,
         sharpe_patience: int = 200,
         ent_coef_auto: bool = True,
@@ -227,38 +209,31 @@ class DynamicHPController(BaseCallback):
     ):
         super().__init__(verbose)
 
-        # ── LR schedule ───────────────────────────────────────────────────
         self.base_lr = base_lr
         self.min_lr = min_lr if min_lr is not None else base_lr / 10
         self.lr_cycle_steps = lr_cycle_steps
 
-        # ── Entropy controller ────────────────────────────────────────────
         self.ent_coef_auto = ent_coef_auto
         self.sharpe_patience = sharpe_patience
         self._ent_coef_current = 0.1
-        self._ent_coef_min = 0.02   # floor raised: 0.001 killed exploration
-        self._ent_coef_max = 0.8
-        self._ent_boost_factor = 1.5
-        self._ent_decay_factor = 0.85
+        self._ent_coef_min = 0.02
+        self._ent_coef_max = 0.5
+        self._ent_boost_factor = 1.3
+        self._ent_decay_factor = 0.90
 
-        # ── Gradient steps controller ─────────────────────────────────────
         self._grad_steps_current = 1
         self._grad_steps_min = 1
-        self._grad_steps_max = 4
+        self._grad_steps_max = 2
 
-        # ── Rolling metrics ───────────────────────────────────────────────
         self.window = window
         self._sharpe_history = deque(maxlen=500)
         self._critic_loss_history = deque(maxlen=200)
         self._best_rolling_sharpe = -np.inf
         self._steps_since_improvement = 0
         self._last_hp_step = 0
-        self._hp_update_freq = 2000     # evaluate every N timesteps
-
-    # ── Helpers ───────────────────────────────────────────────────────────
+        self._hp_update_freq = 5000
 
     def _cosine_lr(self) -> float:
-        """Cosine annealing with warm restarts (SGDR)."""
         t = self.num_timesteps % self.lr_cycle_steps
         cos_val = math.cos(math.pi * t / self.lr_cycle_steps)
         return self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1 + cos_val)
@@ -270,22 +245,13 @@ class DynamicHPController(BaseCallback):
         return float(np.mean(recent))
 
     def _critic_loss_cv(self) -> float:
-        """Coefficient of variation of recent critic losses (std / mean)."""
         if len(self._critic_loss_history) < 10:
             return 0.0
         arr = np.array(self._critic_loss_history)
         mean = np.mean(arr)
         return float(np.std(arr) / mean) if mean > 1e-10 else 0.0
 
-    # ── SB3 hook ──────────────────────────────────────────────────────────
-
     def _on_step(self) -> bool:
-
-        # ── Collect episode Sharpe ─────────────────────────────────────────
-        # SB3 + VecNormalize passes custom info keys via two routes:
-        #   1. infos[i]["episode_sharpe"]       — direct (older SB3)
-        #   2. infos[i]["final_info"]["episode_sharpe"] — Gymnasium vec env
-        # Fallback: compute Sharpe proxy from raw episode reward
         for info in self.locals.get("infos", []):
             sharpe = None
             if "episode_sharpe" in info:
@@ -294,26 +260,16 @@ class DynamicHPController(BaseCallback):
                 fi = info["final_info"]
                 if isinstance(fi, dict) and "episode_sharpe" in fi:
                     sharpe = fi["episode_sharpe"]
-
-            if sharpe is None and "episode" in info:
-                # Proxy: treat normalised episode reward as Sharpe estimate
-                # This is a rough approximation but keeps the deque filling
-                ep_r = info["episode"]["r"]
-                ep_l = max(info["episode"]["l"], 1)
-                sharpe = float(ep_r / (abs(ep_r / ep_l) + 1e-8))
-
+            if sharpe is None and "total_pnl" in info:
+                sharpe=float(info["total_pnl"])
             if sharpe is not None:
                 self._sharpe_history.append(float(sharpe))
 
-        # ── Collect critic loss from SB3 logger ───────────────────────────
         if hasattr(self.model, 'logger'):
             name_map = self.model.logger.name_to_value
             if "train/critic_loss" in name_map:
-                self._critic_loss_history.append(
-                    name_map["train/critic_loss"]
-                )
+                self._critic_loss_history.append(name_map["train/critic_loss"])
 
-        # Only run HP updates every _hp_update_freq steps
         if (self.num_timesteps - self._last_hp_step) < self._hp_update_freq:
             return True
 
@@ -321,16 +277,10 @@ class DynamicHPController(BaseCallback):
         self._update_lr()
         self._update_entropy()
         self._update_gradient_steps()
-
         return True
-
-    # ── Controller 1: Learning rate ───────────────────────────────────────
 
     def _update_lr(self):
         new_lr = self._cosine_lr()
-
-        # SAC has separate optimizers for actor and critic — there is no
-        # single policy.optimizer. Update each one individually.
         self.model.learning_rate = new_lr
 
         policy = self.model.policy
@@ -348,18 +298,13 @@ class DynamicHPController(BaseCallback):
 
         self.logger.record("dynamic_hp/learning_rate", new_lr)
 
-        # Announce warm restarts
         if self.verbose >= 1:
             cycle_pos = self.num_timesteps % self.lr_cycle_steps
             if cycle_pos < self._hp_update_freq:
                 print(f"\n[DHP] LR warm restart at step {self.num_timesteps:,} "
                       f"→ {new_lr:.2e}")
 
-    # ── Controller 2: Entropy coefficient ────────────────────────────────
-
     def _update_entropy(self):
-        # SAC's auto mode manages ent_coef via its own dual gradient descent
-        # — don't interfere
         if self.ent_coef_auto:
             return
 
@@ -367,7 +312,6 @@ class DynamicHPController(BaseCallback):
         if rolling <= 0 or len(self._sharpe_history) < self.window:
             return
 
-        # Track improvement
         if rolling > self._best_rolling_sharpe + 0.02:
             self._best_rolling_sharpe = rolling
             self._steps_since_improvement = 0
@@ -377,7 +321,6 @@ class DynamicHPController(BaseCallback):
         old_ent = self._ent_coef_current
 
         if self._steps_since_improvement >= self.sharpe_patience:
-            # Plateau — explore more
             self._ent_coef_current = min(
                 self._ent_coef_current * self._ent_boost_factor,
                 self._ent_coef_max
@@ -386,17 +329,13 @@ class DynamicHPController(BaseCallback):
             if self.verbose >= 1:
                 print(f"\n[DHP] Sharpe plateau ({rolling:.3f}) → "
                       f"ent_coef {old_ent:.4f} → {self._ent_coef_current:.4f}")
-
         elif rolling > self._best_rolling_sharpe * 0.95:
-            # Improving — exploit more
             self._ent_coef_current = max(
                 self._ent_coef_current * self._ent_decay_factor,
                 self._ent_coef_min
             )
 
-        # Apply to model tensor
-        import torch
-        self.model.ent_coef_tensor = torch.tensor(
+        self.model.ent_coef_tensor = torch.tensor(  # type: ignore[attr-defined]
             self._ent_coef_current, device=self.model.device
         )
 
@@ -405,28 +344,27 @@ class DynamicHPController(BaseCallback):
         self.logger.record("dynamic_hp/steps_since_improvement",
                            self._steps_since_improvement)
 
-    # ── Controller 3: Gradient steps ─────────────────────────────────────
-
     def _update_gradient_steps(self):
         cv = self._critic_loss_cv()
         rolling = self._rolling_sharpe()
+        if(rolling>self._best_rolling_sharpe):
+            self._best_rolling_sharpe=rolling
         old_gs = self._grad_steps_current
 
         if cv > 0.5 and self._grad_steps_current > self._grad_steps_min:
-            # Critic unstable — reduce gradient pressure
             self._grad_steps_current = max(
                 self._grad_steps_current - 1, self._grad_steps_min
             )
         elif (cv < 0.2
               and rolling > 0.5
+              and self.num_timesteps > 100_000
               and self._grad_steps_current < self._grad_steps_max):
-            # Critic stable + decent performance — extract more signal
             self._grad_steps_current = min(
                 self._grad_steps_current + 1, self._grad_steps_max
             )
 
         if self._grad_steps_current != old_gs:
-            self.model.gradient_steps = self._grad_steps_current
+            self.model.gradient_steps = self._grad_steps_current  # type: ignore[attr-defined]
             if self.verbose >= 1:
                 print(f"\n[DHP] gradient_steps {old_gs} → "
                       f"{self._grad_steps_current} "
@@ -443,6 +381,7 @@ class DynamicHPController(BaseCallback):
 def make_env(env_config: dict, seed: int = 0):
     def _init():
         env = OptionsHedgingEnv(**env_config, seed=seed)
+        env= Monitor(env)  # Wrap with Monitor for episode logging
         return env
     return _init
 
@@ -456,20 +395,17 @@ def train(args):
     print("  SAC Agent Training — Dynamic HP Control")
     print("=" * 70)
 
-    # ─── Device setup ─────────────────────────────────────────────────────
     device = get_device(prefer=args.device)
     patch_sb3_device(device)
 
-    # Auto-scale batch/buffer sizes for GPU if user didn't override defaults
     if device != "cpu":
-        if args.batch_size == 256:          # still at the CLI default
+        if args.batch_size == 256:
             args.batch_size = recommended_batch_size(device, base=args.batch_size)
             print(f"[GPU] Auto batch_size  → {args.batch_size}")
-        if args.buffer_size == 200_000:     # still at the CLI default
+        if args.buffer_size == 200_000:
             args.buffer_size = recommended_buffer_size(device, base=args.buffer_size)
             print(f"[GPU] Auto buffer_size → {args.buffer_size:,}")
 
-    # ─── Environment config ───────────────────────────────────────────────
     env_config = {
         "simulator_type": args.simulator,
         "S0": 100.0,
@@ -479,7 +415,9 @@ def train(args):
         "sigma": 0.2,
         "mu": 0.05,
         "n_steps": 30,
-        "transaction_cost": 0.001,
+        "transaction_cost": 0.003,
+        "execution_delay": 0,
+        "variable_tc": False,
     }
     if args.simulator == "heston":
         env_config.update({
@@ -490,7 +428,6 @@ def train(args):
     print(f"   Steps/episode   : {env_config['n_steps']}")
     print(f"   Total timesteps : {args.total_timesteps:,}")
 
-    # ─── Vectorized envs ──────────────────────────────────────────────────
     n_envs = args.n_envs
     train_envs = DummyVecEnv(
         [make_env(env_config, seed=i) for i in range(n_envs)]
@@ -506,39 +443,37 @@ def train(args):
         clip_obs=10.0, training=False,
     )
 
-    # ─── Directories ─────────────────────────────────────────────────────
     model_dir = Path(args.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ─── Model ────────────────────────────────────────────────────────────
     policy_kwargs = dict(
         features_extractor_class=OptionsFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=128),
-        net_arch=dict(pi=[128, 64], qf=[128, 64]),  # smaller heads — extractor does heavy lifting
+        net_arch=dict(pi=[128, 64], qf=[128, 64]),
     )
     ent_coef_auto = (args.ent_coef == "auto")
-    # Allow tune.py to inject best architecture via args.policy_kwargs
     if hasattr(args, 'policy_kwargs') and args.policy_kwargs:
         policy_kwargs = args.policy_kwargs
 
     model = SAC(
         "MlpPolicy",
         train_envs,
-        verbose=0,                  # DHP callback handles printing
+        verbose=0,
         learning_rate=args.lr,
         buffer_size=args.buffer_size,
         batch_size=args.batch_size,
         tau=args.tau,
         gamma=args.gamma,
         ent_coef=args.ent_coef,
+        target_entropy=args.target_entropy if ent_coef_auto else "auto",
         learning_starts=args.learning_starts,
         train_freq=(1, "step"),
-        gradient_steps=1,           # DHP adjusts this dynamically
+        gradient_steps=args.gradient_steps,
         policy_kwargs=policy_kwargs,
         tensorboard_log=str(log_dir),
-        device=device,              # ← GPU/MPS/CPU routing
+        device=device,
         seed=args.seed,
     )
 
@@ -550,15 +485,15 @@ def train(args):
     print(f"   tau            : {args.tau}")
     print(f"   gamma          : {args.gamma}")
     print(f"   ent_coef       : {args.ent_coef}")
+    print(f"   target_entropy : {args.target_entropy}")
     print(f"   n_envs         : {n_envs}")
 
     print(f"\n[DHP] Dynamic controllers:")
     print(f"   LR     → cosine annealing [{args.lr:.2e} → {args.lr/10:.2e}], "
           f"cycle={args.lr_cycle_steps:,} steps")
     print(f"   Entropy→ {'disabled (SAC auto mode)' if ent_coef_auto else 'enabled — responds to Sharpe plateau'}")
-    print(f"   GradSteps → dynamic [1–4] based on critic loss stability")
+    print(f"   GradSteps → dynamic [1–2] based on critic loss stability")
 
-    # ─── Callbacks ────────────────────────────────────────────────────────
     sim_tag_early = args.simulator.lower()
     eval_callback = EvalCallback(
         eval_env,
@@ -571,7 +506,7 @@ def train(args):
     )
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=max(args.total_timesteps // 10, 5000),
+        save_freq=max(args.total_timesteps // (10*args.n_envs), 1000),
         save_path=str(model_dir / "checkpoints"),
         name_prefix="sac_hedger",
         verbose=1,
@@ -582,14 +517,19 @@ def train(args):
     dhp_callback = DynamicHPController(
         base_lr=args.lr,
         min_lr=args.lr / 10,
-        lr_cycle_steps=args.lr_cycle_steps,
+        lr_cycle_steps=args.total_timesteps // 2,
         window=50,
         sharpe_patience=200,
-        ent_coef_auto=ent_coef_auto,
+        ent_coef_auto=True,
         verbose=1,
     )
+    checkpoints= sorted(glob.glob(str(model_dir / "checkpoints"/"*.zip")))
+    if checkpoints:
+        latest = max(checkpoints, key=os.path.getctime)
+        print(f"\n[RESUME] Found checkpoint {latest}, resuming training...")
+        model = SAC.load(latest, env=train_envs, device=device)
+        print(f"[RESUME]Loaded model from {latest}, resuming training...")
 
-    # ─── Train ────────────────────────────────────────────────────────────
     print(f"\n[START] Starting training...\n")
     start_time = time.time()
 
@@ -610,8 +550,6 @@ def train(args):
     elapsed = time.time() - start_time
     print(f"\n[DONE] Training complete in {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
-    # ─── Save ─────────────────────────────────────────────────────────────
-    # Include simulator name so GBM/Heston/Jump models don't overwrite each other
     sim_tag    = args.simulator.lower()
     final_name = f"sac_hedger_{sim_tag}_final"
     final_path = str(model_dir / final_name)
@@ -620,21 +558,13 @@ def train(args):
 
     model.save(final_path)
     train_envs.save(vnorm_path)
-
-    # Also save a generic "latest" pointer so evaluate.py works without flags
     model.save(str(model_dir / "sac_hedger_final"))
     train_envs.save(str(model_dir / "vec_normalize.pkl"))
 
     print(f"\n[SAVE] Model      : {final_path}.zip")
     print(f"       Best model  : {model_dir}/best_{sim_tag}/best_model.zip")
     print(f"       VecNormalize: {vnorm_path}")
-    print(f"       Generic link: {model_dir}/sac_hedger_final.zip  (latest run)")
-    print(f"\n[TIP]  To evaluate this specific model:")
-    print(f"         python agent/evaluate.py --simulator {sim_tag} \\")
-    print(f"           --model-path {final_path} \\")
-    print(f"           --vnorm-path {vnorm_path}")
 
-    # ─── Quick Evaluation (fixed seeding) ─────────────────────────────────
     print(f"\n[EVAL] Quick evaluation (100 episodes)...")
     eval_rewards = []
     eval_pnls = []
@@ -645,7 +575,6 @@ def train(args):
     test_env.norm_reward = False
 
     for ep in range(100):
-        # VecNormalize doesn't accept seed in reset() — set it separately
         test_env.seed(42000 + ep)
         obs = test_env.reset()
         done = False
@@ -674,7 +603,6 @@ def train(args):
         else:
             print("   [WARN] PnL std near zero — check episode seeding")
 
-    # ─── DHP summary ──────────────────────────────────────────────────────
     print(f"\n[DHP] Final state:")
     print(f"   LR at end          : {dhp_callback._cosine_lr():.2e}")
     print(f"   Final grad_steps   : {dhp_callback._grad_steps_current}")
@@ -690,35 +618,28 @@ def train(args):
     return model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train SAC hedging agent with dynamic HP control"
     )
     parser.add_argument("--device", type=str, default="cuda",
-                        choices=["auto", "cuda", "mps", "cpu"],
-                        help="Compute device: auto (default), cuda, mps, or cpu")
-    parser.add_argument("--total-timesteps", type=int, default=1000000) 
-    parser.add_argument("--simulator", type=str, default="heston",
+                        choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--total-timesteps", type=int, default=2000000)      # was 1000000
+    parser.add_argument("--simulator", type=str, default="heston",             # was heston
                         choices=["gbm", "heston", "jump"])
-    parser.add_argument("--lr", type=float, default=3e-4) 
-    parser.add_argument("--lr-cycle-steps", type=int, default=100_000,
-                        help="Steps per cosine annealing LR cycle")
-    parser.add_argument("--buffer-size", type=int, default=200_000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--ent-coef", type=str, default="auto",
-                        help="'auto' lets SAC manage entropy; a float "
-                             "enables the dynamic entropy controller")
-    parser.add_argument("--learning-starts", type=int, default=1000)
-    parser.add_argument("--n-envs", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)                    # was 3e-4
+    parser.add_argument("--lr-cycle-steps", type=int, default=500_000)       # was 100_000
+    parser.add_argument("--buffer-size", type=int, default=500_000)          # was 200_000
+    parser.add_argument("--batch-size", type=int, default=256)               # was 256
+    parser.add_argument("--tau", type=float, default=0.01)
+    parser.add_argument("--gamma", type=float, default=0.99)                # was 0.99
+    parser.add_argument("--ent-coef", type=str, default="0.15")              # was auto
+    parser.add_argument("--learning-starts", type=int, default=10_000)         # was 1000
+    parser.add_argument("--n-envs", type=int, default=6)                     # was 4
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-dir", type=str, default="agent/models")
     parser.add_argument("--log-dir", type=str, default="tb_logs")
-
+    parser.add_argument("--gradient-steps", type=int, default=1)
+    parser.add_argument("--target-entropy", type=float, default=-0.5)
     args = parser.parse_args()
     train(args)

@@ -1,18 +1,20 @@
-# ─── Python ───────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
+*.pyo
+*.so
+*.egg
 *.egg-info/
 dist/
 build/
-*.egg
 .eggs/
-.coverage*
-# ─── C++ Build ────────────────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+
+# C++ build
 build/
-*.o
-*.so
-*.pyd
 *.dll
 *.lib
 *.exp
@@ -20,35 +22,31 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
-compile_commands.json
 
-# ─── RL Models ────────────────────────────────────────────────────────────────
-agent/models/checkpoints/
-agent/models/best/
+# Models (large files — store separately)
 agent/models/*.zip
 agent/models/*.pkl
+agent/models/checkpoints/
+agent/models/best_*/
+
+# Training artifacts
 tb_logs/
-*.zip
+*.json
 
-# ─── Data ─────────────────────────────────────────────────────────────────────
-*.csv
-*.parquet
-data/
+# Environment
+.env
+*.env.local
 
-# ─── IDE ──────────────────────────────────────────────────────────────────────
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# ─── OS ───────────────────────────────────────────────────────────────────────
+# OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# ─── Env ──────────────────────────────────────────────────────────────────────
-.env
-.venv/
-venv/
-env/
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb

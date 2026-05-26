@@ -1,9 +1,16 @@
 """
-Historical Backtester — yfinance Replay Environment
+Historical Backtester — yfinance Replay Environment  v2
 
-Downloads real SPY options chain data via yfinance and replays
-historical price paths to test the trained SAC agent on real
-market conditions.
+Key upgrades over v1:
+  - VIX as IV proxy       : uses ^VIX daily close as 30-day implied vol
+                            for SPY, replacing the inaccurate realized-vol
+                            proxy. vol_carry = realized_vol / VIX is now
+                            a meaningful signal.
+  - Per-episode IV ref    : each episode uses the VIX value at its start
+                            date, not a single fixed sigma for all episodes.
+  - More baselines        : LelandHedger and WhalleyWilmottHedger added
+                            alongside DeltaHedger for richer comparison.
+  - Stride=1 default      : maximises episode count for robust statistics.
 """
 
 import os
@@ -18,223 +25,210 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from src.pricer.pricer_py import bs_call, greeks_call, implied_vol
 
 
-def fetch_spy_data(period: str = "6mo") -> pd.DataFrame:
-    """
-    Fetch historical SPY price data via yfinance.
+# ─────────────────────────────────────────────────────────────────────────────
+# Data fetchers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Args:
-        period: Data period ('1mo', '3mo', '6mo', '1y')
-
-    Returns:
-        DataFrame with Date, Open, High, Low, Close, Volume
-    """
+def fetch_spy_data(period: str = "1y") -> pd.DataFrame:
+    """Fetch historical SPY price data via yfinance."""
     import yfinance as yf
-
-    spy = yf.Ticker("SPY")
+    spy  = yf.Ticker("SPY")
     hist = spy.history(period=period)
-
     if hist.empty:
         raise ValueError("Failed to fetch SPY data from yfinance")
-
     hist = hist.reset_index()
-    hist['Date'] = pd.to_datetime(hist['Date'])
+    hist['Date'] = pd.to_datetime(hist['Date']).dt.tz_localize(None)
     hist = hist.sort_values('Date').reset_index(drop=True)
-
     print(f"📈 Fetched {len(hist)} days of SPY data "
           f"({hist['Date'].iloc[0].date()} to {hist['Date'].iloc[-1].date()})")
-
     return hist
 
 
-def fetch_options_chain(expiry: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_vix_data(period: str = "1y") -> pd.DataFrame:
     """
-    Fetch current SPY options chain from yfinance.
+    Fetch VIX daily close as 30-day implied vol proxy for SPY.
 
-    Args:
-        expiry: Specific expiry date string (YYYY-MM-DD). If None, uses nearest.
+    VIX represents the market's expectation of 30-day SPY volatility
+    (annualised, in percentage points). Dividing by 100 gives the
+    implied vol in the same units as sigma in the BSM formula.
 
-    Returns:
-        (calls_df, puts_df) DataFrames with strike, lastPrice, impliedVolatility, etc.
+    This is far more accurate than using realised vol as an IV proxy —
+    realised vol lags by 20 days, while VIX is forward-looking.
     """
     import yfinance as yf
+    vix  = yf.Ticker("^VIX")
+    hist = vix.history(period=period)
+    if hist.empty:
+        raise ValueError("Failed to fetch VIX data from yfinance")
+    hist = hist.reset_index()
+    hist['Date'] = pd.to_datetime(hist['Date']).dt.tz_localize(None)
+    hist = hist.sort_values('Date').reset_index(drop=True)
+    hist['iv'] = hist['Close'] / 100.0   # convert % → decimal
+    print(f"📊 Fetched {len(hist)} days of VIX data  "
+          f"(mean IV={hist['iv'].mean():.1%}, "
+          f"range [{hist['iv'].min():.1%}, {hist['iv'].max():.1%}])")
+    return hist[['Date', 'iv']]
 
-    spy = yf.Ticker("SPY")
-    expiries = spy.options  # list of available expiry dates
 
+def fetch_options_chain(expiry: Optional[str] = None
+                        ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch current SPY options chain (for reference / live use)."""
+    import yfinance as yf
+    spy     = yf.Ticker("SPY")
+    expiries = spy.options
     if not expiries:
         raise ValueError("No options data available for SPY")
-
     if expiry is None:
-        expiry = expiries[min(2, len(expiries) - 1)]  # pick ~1 month out
-
-    print(f"📋 Available expiries: {expiries[:8]}...")
-    print(f"   Selected: {expiry}")
-
+        expiry = expiries[min(2, len(expiries) - 1)]
     chain = spy.option_chain(expiry)
     return chain.calls, chain.puts
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Backtester
+# ─────────────────────────────────────────────────────────────────────────────
+
 class HistoricalBacktester:
     """
-    Replays historical price data to evaluate hedging agents.
+    Replays historical SPY price paths to evaluate hedging agents.
 
-    Instead of simulating prices with GBM/Heston, this uses actual
-    SPY closing prices to step through time. This tests whether
-    the RL agent generalizes to real market dynamics.
+    v2 improvements:
+      - iv_series: per-day implied vol from VIX (replaces fixed sigma)
+      - vol_carry = realized_vol / iv_at_episode_start (now meaningful)
+      - Each episode uses the VIX value on its start date as the
+        reference implied vol for premium pricing and vol_carry.
     """
 
-    def __init__(self, prices: np.ndarray, K: float, r: float = 0.05,
-                 sigma: float = 0.2, T_days: int = 30,
-                 transaction_cost: float = 0.001):
+    def __init__(self, prices: np.ndarray, iv_series: np.ndarray,
+                 K: float, r: float = 0.05,
+                 T_days: int = 30, transaction_cost: float = 0.003):
         """
         Args:
-            prices: Array of historical daily closing prices
-            K: Strike price for the option
-            r: Risk-free rate
-            sigma: Initial implied volatility estimate
-            T_days: Option lifetime in trading days
-            transaction_cost: Cost rate per unit traded
+            prices:           Historical daily closing prices
+            iv_series:        Daily implied vol (VIX/100), aligned with prices
+            K:                Strike price (used as fallback; each episode
+                              sets ATM strike = S0)
+            r:                Risk-free rate
+            T_days:           Option lifetime in trading days
+            transaction_cost: One-way proportional TC rate
         """
-        self.prices = prices
-        self.K = K
-        self.r = r
-        self.sigma = sigma
-        self.T_days = T_days
-        self.tc_rate = transaction_cost
+        assert len(prices) == len(iv_series), \
+            "prices and iv_series must have the same length"
+        self.prices    = prices
+        self.iv_series = iv_series
+        self.K         = K
+        self.r         = r
+        self.T_days    = T_days
+        self.tc_rate   = transaction_cost
 
     def run_episode(self, agent, start_idx: int = 0,
                     residual_action: bool = False) -> dict:
         """
-        Run a single backtest episode starting from start_idx.
+        Run one 30-day hedging episode.
 
-        Args:
-            agent: Agent with .predict(obs) -> (action, state)
-            start_idx: Starting index in price array
-
-        Returns:
-            Episode results dict
+        The implied vol at episode start (VIX[start_idx]) is used as:
+          - The reference sigma for pricing the initial option premium
+          - The denominator in vol_carry = realized_vol / iv_start
+            (so vol_carry > 1 means realised vol exceeded implied vol)
         """
         if start_idx + self.T_days >= len(self.prices):
             raise ValueError("Not enough data for a full episode")
 
-        S0 = self.prices[start_idx]
-        K = S0  # ATM strike per episode — avoids deep OTM/ITM premium explosion
-        T = self.T_days / 252
+        S0      = self.prices[start_idx]
+        K       = S0                          # ATM strike per episode
+        T       = self.T_days / 252
+        iv_start = float(self.iv_series[start_idx])  # VIX at episode start
+        iv_start = max(iv_start, 0.05)        # floor at 5%
 
-        # Initial option premium — normalised to training-env scale (S0=100)
-        scale = 100.0 / S0
-        premium = bs_call(S0, K, T, self.r, self.sigma) * scale
-        premium = max(premium, 0.5)  # floor: prevents division explosion on near-zero OTM premiums
+        # Normalise to training-env scale (trained on S0=100)
+        scale        = 100.0 / S0
+        premium      = bs_call(S0, K, T, self.r, iv_start) * scale
+        premium      = max(premium, 0.5)
         portfolio_value = premium
-        hedge_position = 0.0
+        hedge_position  = 0.0
 
-        pnl_history = []
-        hedge_history = []
-        price_history = [S0]
+        pnl_history, hedge_history, price_history = [], [], [S0]
 
         if hasattr(agent, 'reset'):
             agent.reset()
 
         for step in range(self.T_days):
-            price = self.prices[start_idx + step]
+            price       = self.prices[start_idx + step]
             T_remaining = max((self.T_days - step) / 252, 1e-10)
 
-            # Compute realized vol from recent returns
+            # ── Realised vol from recent returns ──────────────────────────
             lookback = min(step + 1, 20)
             if lookback >= 2:
-                recent_prices = self.prices[
+                recent = self.prices[
                     start_idx + max(0, step - lookback):start_idx + step + 1
                 ]
-                log_returns = np.diff(np.log(recent_prices))
-                realized_vol = float(np.std(log_returns) * np.sqrt(252))
-                realized_vol = max(realized_vol, 0.05)  # floor
+                log_ret      = np.diff(np.log(recent))
+                realized_vol = float(np.std(log_ret) * np.sqrt(252))
+                realized_vol = max(realized_vol, 0.05)
             else:
-                realized_vol = self.sigma
+                realized_vol = iv_start
 
-            # Compute Greeks
+            # ── Greeks ────────────────────────────────────────────────────
             try:
-                g = greeks_call(price, K, T_remaining, self.r, realized_vol)
-                delta = g.delta
-                gamma = g.gamma
-            except:
-                delta = 0.5
-                gamma = 0.01
-
-            # Build 11-dim observation (matches options_env._get_obs)
-            pnl_norm = (portfolio_value - premium) / max(premium, 1e-6)
-
-            # Vol carry: realized / implied ratio
-            vol_carry = float(np.clip(realized_vol / max(self.sigma, 1e-6), 0.0, 5.0))
-
-            try:
-                vega  = float(greeks_call(price, K, T_remaining, self.r, realized_vol).vega)
-                theta = float(greeks_call(price, K, T_remaining, self.r, realized_vol).theta)
+                g     = greeks_call(price, K, T_remaining, self.r, realized_vol)
+                delta = float(g.delta)
+                gamma = float(g.gamma)
+                vega  = float(g.vega)
+                theta = float(g.theta)
             except Exception:
-                vega, theta = 0.0, 0.0
+                delta, gamma, vega, theta = 0.5, 0.01, 0.0, 0.0
 
-            # Normalise Greeks to training-env scale (trained on S0=100).
-            # vega, theta, gamma all scale with spot price, so we
-            # divide by (S0/100) to match the magnitude the policy saw
-            # during training. Without this, obs[6-8] are 6x out of range
-            # and the policy produces garbage actions.
+            # ── Observation ───────────────────────────────────────────────
+            pnl_norm    = (portfolio_value - premium) / max(premium, 1e-6)
+            # vol_carry: realized / implied — now uses VIX as denominator
+            vol_carry   = float(np.clip(realized_vol / max(iv_start, 1e-6),
+                                        0.0, 5.0))
             norm_factor = S0 / 100.0
+
+            if vol_carry < 0.85:
+                vol_regime = 0.0
+            elif vol_carry < 1.25:
+                vol_regime = 0.5
+            else:
+                vol_regime = 1.0
+
             obs = np.array([
                 price / S0,
-                K / S0,
+                K     / S0,
                 T_remaining / T,
                 realized_vol,
-                delta,                                      # dimensionless [0,1]
-                (gamma * 100.0) / norm_factor,              # gamma scales with 1/S
-                np.clip(pnl_norm, -10, 10),
-                vega       / norm_factor,                   # vega scales with S
-                np.clip(-theta / norm_factor, 0.0, 10.0),  # negate: short call earns theta decay (matches options_env._get_obs)
-                vol_carry,                                  # dimensionless ratio
-                float(np.clip(hedge_position, -1.0, 1.0)), # dimensionless [-1,1]
+                delta,
+                (gamma * 100.0) / norm_factor,
+                float(np.clip(pnl_norm, -10, 10)),
+                vega  / norm_factor,
+                float(np.clip(-theta / norm_factor, 0.0, 10.0)),
+                vol_carry,
+                float(np.clip(hedge_position, -1.0, 1.0)),
+                vol_regime,
             ], dtype=np.float32)
 
-            # Get action
-            action, _ = agent.predict(obs)
+            # ── Action ────────────────────────────────────────────────────
             action, _ = agent.predict(obs)
             if residual_action:
-                # SAC trained with residual architecture:
-                # output is a correction to delta, NOT an absolute hedge.
-                # Without this, action=-0.2 means "short 20%" not "reduce by 6%"
-                target_hedge = float(np.clip(delta + 0.3 * float(action[0]), -1.0, 1.0))
+                target_hedge = float(np.clip(
+                    delta + 0.3 * float(action[0]), -1.0, 1.0))
             else:
                 target_hedge = float(np.clip(action[0], -1.0, 1.0))
 
-            # Transaction cost
-            tc = self.tc_rate * abs(target_hedge - hedge_position) * (price * 100.0 / S0)
+            # ── TC ────────────────────────────────────────────────────────
+            tc = self.tc_rate * abs(target_hedge - hedge_position) * (price * scale)
             portfolio_value -= tc
+            hedge_position   = target_hedge
 
-            # Update position
-            old_hedge = hedge_position
-            hedge_position = target_hedge
+            # ── PnL ───────────────────────────────────────────────────────
+            next_price = (self.prices[start_idx + step + 1]
+                          if step + 1 < self.T_days else price)
+            price_change_norm = (next_price - price) * scale
+            hedge_pnl         = hedge_position * price_change_norm
 
-            # Next price
-            if step + 1 < self.T_days:
-                next_price = self.prices[start_idx + step + 1]
-            else:
-                next_price = price
-
-            # PnL — normalise by S0 so units match the training env.
-            # During training, hedge_position is a fraction of 1 unit where
-            # the stock is normalised to S0=100. In the real backtest S0
-            # can be ~$731, so without normalisation a position of 0.5
-            # earns 0.5 * $5 = $2.50/step instead of 0.5 * $0.68 = $0.34.
-            # Dividing price_change by S0 restores the correct scaling.
-            # Normalise price change to training-env scale (S0=100)
-            # hedge_position is in [-1,1], trained on S0=100 prices
-            price_change_norm = (next_price - price) * (100.0 / S0)
-            hedge_pnl = hedge_position * price_change_norm
-
-            # Option PnL: also normalise option values by S0 for consistency
-            T_next = max((self.T_days - step - 1) / 252, 1e-10)
-            # Normalise option prices to training-env scale (S0=100)
-            # so option_pnl and hedge_pnl are in the same units
-            scale = 100.0 / S0
-            old_opt = bs_call(price,      K, T_remaining, self.r, realized_vol) * scale
-            new_opt = bs_call(next_price, K, T_next,      self.r, realized_vol) * scale
+            T_next   = max((self.T_days - step - 1) / 252, 1e-10)
+            old_opt  = bs_call(price,      K, T_remaining, self.r, realized_vol) * scale
+            new_opt  = bs_call(next_price, K, T_next,      self.r, realized_vol) * scale
             option_pnl = -(new_opt - old_opt)
 
             total_pnl = hedge_pnl + option_pnl
@@ -243,303 +237,253 @@ class HistoricalBacktester:
             hedge_history.append(target_hedge)
             price_history.append(next_price)
 
-        # Final settlement
+        # ── Final settlement ──────────────────────────────────────────────
         final_price = self.prices[start_idx + self.T_days]
-        intrinsic = max(final_price - K, 0.0) * scale
+        intrinsic   = max(final_price - K, 0.0) * scale
         portfolio_value -= intrinsic
 
-        pnls = np.array(pnl_history)
-
-        # Normalise PnL by premium so results are comparable across
-        # different price levels and option maturities.
-        # This matches how the training env computes rewards.
+        pnls      = np.array(pnl_history)
         pnls_norm = pnls / max(premium, 1e-6)
-        total_pnl_norm = float(np.sum(pnls_norm))
 
-        # Sharpe on normalised daily PnL, annualised
-        # Information ratio across 30 steps (not annualised)
-        sharpe = float(
-            np.mean(pnls_norm) / (np.std(pnls_norm) + 1e-10)
-        )
-        # Max drawdown on normalised cumulative PnL
+        sharpe  = float(np.mean(pnls_norm) / (np.std(pnls_norm) + 1e-10))
         cum_pnl = np.cumsum(pnls_norm)
-        running_max = np.maximum.accumulate(cum_pnl)
-        drawdowns_arr = running_max - cum_pnl
-        max_dd = float(np.max(drawdowns_arr)) if len(drawdowns_arr) > 0 else 0.0
+        max_dd  = float(np.max(np.maximum.accumulate(cum_pnl) - cum_pnl))
 
         return {
-            "portfolio_value": portfolio_value,
-            "total_pnl":       total_pnl_norm,        # normalised by premium
-            "total_pnl_raw":   float(np.sum(pnls)),   # raw dollars (for reference)
-            "premium":         premium,
+            "portfolio_value": float(portfolio_value),
+            "total_pnl":       float(np.sum(pnls_norm)),
+            "total_pnl_raw":   float(np.sum(pnls)),
+            "premium":         float(premium),
+            "iv_start":        float(iv_start),
             "pnl_history":     pnls_norm.tolist(),
-            "pnl_history_raw": pnl_history,
             "hedge_history":   hedge_history,
             "price_history":   price_history,
             "sharpe":          sharpe,
             "max_drawdown":    max_dd,
-            "transaction_costs": float(
-                sum(self.tc_rate * abs(hedge_history[i] - (
-                    hedge_history[i-1] if i > 0 else 0
-                )) * price_history[i] for i in range(len(hedge_history)))
-            ) / max(premium, 1e-6),   # also normalised
         }
 
-    def run_backtest(self, agent, stride: int = 5,
+    def run_backtest(self, agent, stride: int = 1,
                      residual_action: bool = False) -> dict:
-        """
-        Run rolling backtests across the full price history.
-
-        Args:
-            agent: Hedging agent
-            stride: Days between episode starts
-
-        Returns:
-            Aggregated backtest results
-        """
+        """Rolling backtest across full price history."""
         n_possible = len(self.prices) - self.T_days - 1
         if n_possible <= 0:
-            raise ValueError("Not enough data for backtesting")
+            raise ValueError("Not enough data")
 
         episodes = []
         for start in range(0, n_possible, stride):
             try:
-                result = self.run_episode(agent, start_idx=start,
-                                          residual_action=residual_action)
-                episodes.append(result)
-            except Exception as e:
+                episodes.append(self.run_episode(
+                    agent, start_idx=start,
+                    residual_action=residual_action))
+            except Exception:
                 continue
 
         if not episodes:
             raise ValueError("No successful episodes")
 
-        sharpes = [e["sharpe"] for e in episodes]
-        pnls = [e["total_pnl"] for e in episodes]
+        sharpes   = [e["sharpe"]     for e in episodes]
+        pnls      = [e["total_pnl"]  for e in episodes]
         drawdowns = [e["max_drawdown"] for e in episodes]
 
         return {
-            "n_episodes": len(episodes),
-            "mean_sharpe": float(np.mean(sharpes)),
-            "std_sharpe": float(np.std(sharpes)),
-            "mean_pnl": float(np.mean(pnls)),
-            "std_pnl": float(np.std(pnls)),
-            "sharpe_ratio": float(np.mean(sharpes)),  # mean of per-episode Sharpes (correct)
-            "sharpe_ratio_cross_ep": float(
-                np.mean(pnls) / (np.std(pnls) + 1e-10)
-            ),  # cross-episode Sharpe (biased by S0 variation — for reference only)
-            "max_max_drawdown": float(np.max(drawdowns)),
-            "episodes": episodes,
+            "n_episodes":          len(episodes),
+            "sharpe_ratio":        float(np.mean(sharpes)),
+            "cross_ep_sharpe":     float(np.mean(pnls) /
+                                         (np.std(pnls) + 1e-10)),
+            "mean_pnl":            float(np.mean(pnls)),
+            "std_pnl":             float(np.std(pnls)),
+            "mean_sharpe":         float(np.mean(sharpes)),
+            "std_sharpe":          float(np.std(sharpes)),
+            "max_max_drawdown":    float(np.max(drawdowns)),
+            "episodes":            episodes,
         }
 
-    @staticmethod
-    def _max_drawdown(pnls: np.ndarray) -> float:
-        cumulative = np.cumsum(pnls)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdowns = running_max - cumulative
-        return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI runner
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse, json
     from pathlib import Path
     from scipy import stats as scipy_stats
 
-    parser = argparse.ArgumentParser(description="Historical SPY backtest")
-    parser.add_argument("--period",     default="1y",
-                        help="yfinance period: 6mo, 1y, 2y (default: 1y)")
-    parser.add_argument("--stride",     type=int, default=5,
-                        help="Days between episode start points (default: 5)")
-    parser.add_argument("--tc",         type=float, default=0.001,
-                        help="Transaction cost rate (default: 0.001)")
-    parser.add_argument("--model-path", default="agent/models/sac_hedger_final",
-                        help="Path to trained SAC model")
-    parser.add_argument("--vnorm-path", default=None,
-                        help="Path to VecNormalize stats (auto-detected if omitted)")
+    parser = argparse.ArgumentParser(description="Historical SPY backtest v2")
+    parser.add_argument("--period",     default="2y")
+    parser.add_argument("--stride",     type=int,   default=1)
+    parser.add_argument("--tc",         type=float, default=0.003)
+    parser.add_argument("--model-path", default="agent/models/sac_hedger_final")
+    parser.add_argument("--vnorm-path", default=None)
     parser.add_argument("--output",     default="agent/historical_results.json")
     args = parser.parse_args()
 
     print("=" * 65)
-    print("  Historical SPY Backtest — SAC vs Delta Hedger")
+    print("  Historical SPY Backtest v2 — VIX as IV proxy")
     print("=" * 65)
 
-    # ── Fetch data ────────────────────────────────────────────────────
-    hist  = fetch_spy_data(args.period)
-    prices = hist["Close"].values
-    K     = float(np.median(prices))      # median as proxy for ATM strike
-    sigma = float(np.std(np.diff(np.log(prices))) * np.sqrt(252))
-    print(f"\n  Estimated historical vol: {sigma:.1%}")
-    print(f"  ATM strike (median spot): {K:.2f}")
+    # ── Fetch SPY + VIX ──────────────────────────────────────────────
+    spy_df  = fetch_spy_data(args.period)
+    vix_df  = fetch_vix_data(args.period)
 
-    bt = HistoricalBacktester(prices, K=K, sigma=sigma,
+    # Align on common dates
+    merged  = spy_df.merge(vix_df, on='Date', how='inner')
+    prices  = merged['Close'].values.astype(float)
+    iv_ser  = merged['iv'].values.astype(float)
+
+    print(f"\n  Aligned {len(prices)} trading days")
+    print(f"  SPY range : ${prices.min():.2f} – ${prices.max():.2f}")
+    print(f"  VIX range : {iv_ser.min():.1%} – {iv_ser.max():.1%}")
+
+    K     = float(np.median(prices))
+    sigma = float(np.mean(iv_ser))   # mean VIX as reference sigma
+    print(f"  Mean IV (VIX): {sigma:.1%}  |  ATM strike: ${K:.2f}")
+
+    bt = HistoricalBacktester(prices, iv_ser, K=K, r=0.05,
                                transaction_cost=args.tc)
 
-    # Auto-detect VecNormalize path: prefer sim-tagged, fall back to generic
+    # ── VecNormalize path ─────────────────────────────────────────────
     if args.vnorm_path is None:
         model_dir = Path(args.model_path).parent
-        sim_tag = Path(args.model_path).stem.replace("sac_hedger_", "").replace("_final", "")
         candidates = [
-            str(model_dir / f"vec_normalize_{sim_tag}.pkl"),
+            str(model_dir / "vec_normalize_heston.pkl"),
             str(model_dir / "vec_normalize.pkl"),
         ]
-        args.vnorm_path = next((c for c in candidates if Path(c).exists()),
-                               str(model_dir / "vec_normalize.pkl"))
-    print(f"  VecNormalize path : {args.vnorm_path}")
+        args.vnorm_path = next(
+            (c for c in candidates if Path(c).exists()),
+            candidates[-1])
+    print(f"  VecNormalize : {args.vnorm_path}")
 
-    # ── Delta Hedger baseline ─────────────────────────────────────────
-    from environment.baselines import DeltaHedger
-    delta_agent = DeltaHedger(K=K, sigma=sigma)
-    print(f"\n[DELTA] Running delta hedge backtest...")
-    delta_results = bt.run_backtest(delta_agent, stride=args.stride)
-    print(f"  Episodes : {delta_results['n_episodes']}")
-    print(f"  Sharpe   : {delta_results['sharpe_ratio']:.4f}")
-    print(f"  Mean PnL : {delta_results['mean_pnl']:.6f}")
-    print(f"  Max DD   : {delta_results['max_max_drawdown']:.6f}")
+    all_results = {}
 
-    all_results = {"DeltaHedger": delta_results}
+    # ── Baselines ─────────────────────────────────────────────────────
+    from environment.baselines import (
+        DeltaHedger, LelandHedger, WhalleyWilmottHedger
+    )
 
-    # ── SAC Agent ─────────────────────────────────────────────────────
+    baseline_specs = [
+        ("DeltaHedger",          DeltaHedger(K=K, sigma=sigma)),
+        ("LelandHedger",         LelandHedger(sigma=sigma, tc_rate=args.tc,
+                                              K=K, r=0.05, T=30/252)),
+        ("WhalleyWilmottHedger", WhalleyWilmottHedger(sigma=sigma,
+                                                       tc_rate=args.tc,
+                                                       K=K, r=0.05,
+                                                       T=30/252)),
+    ]
+
+    for name, agent in baseline_specs:
+        print(f"\n[{name}] Running backtest...")
+        res = bt.run_backtest(agent, stride=args.stride)
+        all_results[name] = res
+        print(f"  Episodes       : {res['n_episodes']}")
+        print(f"  Mean Sharpe    : {res['sharpe_ratio']:.4f}")
+        print(f"  Cross-ep Sharpe: {res['cross_ep_sharpe']:.4f}")
+        print(f"  Mean PnL       : {res['mean_pnl']:.6f}")
+
+    # ── SAC agent ─────────────────────────────────────────────────────
     model_zip = args.model_path + ".zip"
     if Path(args.model_path).exists() or Path(model_zip).exists():
-        print(f"\n[SAC] Loading model from {args.model_path}...")
+        print(f"\n[SAC] Loading from {args.model_path}...")
+        from stable_baselines3 import SAC as SB3SAC
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+        from agent.gpu_utils import get_device
+        from environment.options_env import OptionsHedgingEnv
 
-        # Warn if VecNormalize dim doesn't match 11-dim obs space
-        try:
-            import pickle as _pkl
-            with open(args.vnorm_path, "rb") as _f:
-                _vn_check = _pkl.load(_f)
-            _dim = len(_vn_check.obs_rms.mean)
-            if _dim != 11:
-                print(f"\n{'='*65}")
-                print(f"  [CRITICAL] OBS MISMATCH: VecNormalize is {_dim}-dim, env is 11-dim.")
-                print(f"  This model was trained BEFORE the obs space expansion.")
-                print(f"  Results will be INVALID. Retrain first:")
-                print(f"    train_all.bat   (or: python agent/train.py --simulator heston)")
-                print(f"{'='*65}\n")
-        except Exception:
-            pass
+        device    = get_device(verbose=True)
+        sac_model = SB3SAC.load(args.model_path, device=device)
 
-        try:
-            from stable_baselines3 import SAC
-            from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-            from agent.gpu_utils import get_device
-            import os
+        class SACAgent:
+            def __init__(self, model, vnorm_path):
+                self.model = model
+                self._vn   = None
+                if os.path.exists(vnorm_path):
+                    try:
+                        dummy = DummyVecEnv([lambda: OptionsHedgingEnv()])
+                        vn    = VecNormalize.load(vnorm_path, dummy)
+                        vn.training    = False
+                        vn.norm_reward = False
+                        self._vn = vn
+                        print(f"[SAC] VecNormalize loaded "
+                              f"(obs_mean={vn.obs_rms.mean[:3].round(3)}...)")
+                    except Exception as e:
+                        print(f"[WARN] VecNormalize load failed: {e}")
+                else:
+                    print(f"[WARN] VecNormalize not found at {vnorm_path}")
 
-            device = get_device(verbose=True)
-            sac_model = SAC.load(args.model_path, device=device)
+            def predict(self, obs):
+                obs_in = obs.reshape(1, -1).astype(np.float32)
+                if self._vn is not None:
+                    obs_in = self._vn.normalize_obs(obs_in)
+                action, state = self.model.predict(obs_in, deterministic=True)
+                return action[0], state
 
-            # Wrap SAC into an agent interface compatible with run_backtest
-            class SACAgent:
-                """
-                Wraps a SAC model with VecNormalize statistics.
-
-                Uses the actual VecNormalize object (not manual obs_rms)
-                to ensure observations are normalised identically to
-                how they were during training.
-                """
-                def __init__(self, model, vnorm_path):
-                    self.model = model
-                    self._vn = None
-                    if os.path.exists(vnorm_path):
-                        try:
-                            from stable_baselines3.common.vec_env import (
-                                DummyVecEnv, VecNormalize
-                            )
-                            from environment.options_env import OptionsHedgingEnv
-                            # Create a dummy env just to load normalisation stats
-                            dummy = DummyVecEnv([lambda: OptionsHedgingEnv()])
-                            vn = VecNormalize.load(vnorm_path, dummy)
-                            vn.training = False   # freeze stats
-                            vn.norm_reward = False
-                            self._vn = vn
-                            print(f"[SAC] VecNormalize loaded: "
-                                  f"obs_mean={vn.obs_rms.mean[:3].round(3)}...")
-                        except Exception as e:
-                            print(f"[WARN] VecNormalize load failed: {e}. "
-                                  f"Using raw observations.")
-                    else:
-                        print(f"[WARN] VecNormalize not found at {vnorm_path}. "
-                              f"Observations will NOT be normalised — results "
-                              f"may be unreliable.")
-
-                def predict(self, obs):
-                    obs_in = obs.reshape(1, -1).astype(np.float32)
-                    if self._vn is not None:
-                        # normalise using the frozen VecNormalize stats
-                        obs_in = self._vn.normalize_obs(obs_in)
-                    action, state = self.model.predict(
-                        obs_in, deterministic=True
-                    )
-                    return action[0], state
-
-            sac_agent = SACAgent(sac_model, args.vnorm_path)
-            print(f"[SAC] Running SAC backtest on same real SPY paths...")
-            sac_results = bt.run_backtest(sac_agent, stride=args.stride,
-                                              residual_action=True)
-            all_results["SAC"] = sac_results
-            print(f"  Episodes : {sac_results['n_episodes']}")
-            print(f"  Sharpe   : {sac_results['sharpe_ratio']:.4f}")
-            print(f"  Mean PnL : {sac_results['mean_pnl']:.6f}")
-            print(f"  Max DD   : {sac_results['max_max_drawdown']:.6f}")
-
-        except Exception as e:
-            print(f"[WARN] SAC evaluation failed: {e}")
+        sac_agent = SACAgent(sac_model, args.vnorm_path)
+        print("[SAC] Running backtest...")
+        sac_res = bt.run_backtest(sac_agent, stride=args.stride,
+                                   residual_action=True)
+        all_results["SAC"] = sac_res
+        print(f"  Episodes       : {sac_res['n_episodes']}")
+        print(f"  Mean Sharpe    : {sac_res['sharpe_ratio']:.4f}")
+        print(f"  Cross-ep Sharpe: {sac_res['cross_ep_sharpe']:.4f}")
+        print(f"  Mean PnL       : {sac_res['mean_pnl']:.6f}")
     else:
-        print(f"\n[WARN] No SAC model found at {args.model_path}.")
-        print("       Run `python agent/train.py` first.")
+        print(f"\n[WARN] No SAC model at {args.model_path}")
 
-    # ── Statistical Significance ──────────────────────────────────────
+    # ── Statistical comparison ────────────────────────────────────────
     if "SAC" in all_results:
-        sac_pnls   = np.array([e["total_pnl"] for e in all_results["SAC"]["episodes"]])
-        delta_pnls = np.array([e["total_pnl"] for e in all_results["DeltaHedger"]["episodes"]])
-        n = min(len(sac_pnls), len(delta_pnls))
-        sac_pnls, delta_pnls = sac_pnls[:n], delta_pnls[:n]
-
-        t_stat, p_value = scipy_stats.ttest_rel(sac_pnls, delta_pnls)
-        diff_mean = np.mean(sac_pnls - delta_pnls)
-
-        # Bootstrap 95% CI on mean PnL difference
-        rng = np.random.default_rng(42)
-        boot_diffs = []
-        for _ in range(10_000):
-            idx = rng.integers(0, n, size=n)
-            boot_diffs.append(np.mean(sac_pnls[idx] - delta_pnls[idx]))
-        ci_lo, ci_hi = np.percentile(boot_diffs, [2.5, 97.5])
+        sac_pnls = np.array([e["total_pnl"]
+                              for e in all_results["SAC"]["episodes"]])
 
         print(f"\n{'=' * 65}")
-        print(f"  STATISTICAL SIGNIFICANCE (paired t-test, n={n} episodes)")
+        print(f"  STATISTICAL RESULTS  (n={len(sac_pnls)} episodes)")
         print(f"{'=' * 65}")
-        print(f"  SAC vs Delta mean PnL difference : {diff_mean:+.6f}")
-        print(f"  95% Bootstrap CI                 : [{ci_lo:+.6f}, {ci_hi:+.6f}]")
-        print(f"  t-statistic                      : {t_stat:.4f}")
-        print(f"  p-value                          : {p_value:.4f}")
-        sig = "YES ✓" if p_value < 0.05 else "NO ✗ (not significant)"
-        print(f"  Significant at 5% level          : {sig}")
 
-        sac_sharpe   = all_results["SAC"]["sharpe_ratio"]
-        delta_sharpe = all_results["DeltaHedger"]["sharpe_ratio"]
-        outperf      = (sac_sharpe / max(delta_sharpe, 1e-10) - 1) * 100
-        print(f"\n  Sharpe outperformance on REAL DATA: {outperf:+.1f}%")
+        for name in ["DeltaHedger", "LelandHedger", "WhalleyWilmottHedger"]:
+            if name not in all_results:
+                continue
+            other_pnls = np.array([e["total_pnl"]
+                                    for e in all_results[name]["episodes"]])
+            n = min(len(sac_pnls), len(other_pnls))
+            t_stat, p_val = scipy_stats.ttest_rel(
+                sac_pnls[:n], other_pnls[:n])
+            diff = float(np.mean(sac_pnls[:n] - other_pnls[:n]))
 
-        all_results["statistics"] = {
-            "t_stat": float(t_stat),
-            "p_value": float(p_value),
-            "mean_pnl_diff": float(diff_mean),
-            "ci_95_lo": float(ci_lo),
-            "ci_95_hi": float(ci_hi),
-            "significant_5pct": bool(p_value < 0.05),
-            "sharpe_outperformance_pct": float(outperf),
-        }
+            rng  = np.random.default_rng(42)
+            boot = [np.mean(sac_pnls[:n][rng.integers(0, n, n)] -
+                            other_pnls[:n][rng.integers(0, n, n)])
+                    for _ in range(10_000)]
+            ci_lo, ci_hi = np.percentile(boot, [2.5, 97.5])
 
-    # ── Save ──────────────────────────────────────────────────────────
+            sac_sh   = all_results["SAC"]["sharpe_ratio"]
+            other_sh = all_results[name]["sharpe_ratio"]
+            outperf  = (sac_sh / max(other_sh, 1e-10) - 1) * 100
+            sig      = "✓" if p_val < 0.05 else "✗"
+
+            print(f"\n  SAC vs {name}:")
+            print(f"    Sharpe  : {sac_sh:.4f} vs {other_sh:.4f}  "
+                  f"({outperf:+.1f}%)")
+            print(f"    PnL diff: {diff:+.6f}  CI [{ci_lo:+.6f}, "
+                  f"{ci_hi:+.6f}]")
+            print(f"    p-value : {p_val:.4f}  {sig}")
+
+            all_results[f"stats_SAC_vs_{name}"] = {
+                "t_stat":    float(t_stat),
+                "p_value":   float(p_val),
+                "mean_diff": diff,
+                "ci_lo":     float(ci_lo),
+                "ci_hi":     float(ci_hi),
+                "sig":       bool(p_val < 0.05),
+                "outperf_pct": float(outperf),
+            }
+
+    # ── Save ─────────────────────────────────────────────────────────
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # strip episode lists for cleaner JSON (keep summary stats)
-    save_results = {}
+    save = {}
     for k, v in all_results.items():
         if isinstance(v, dict):
-            save_results[k] = {kk: vv for kk, vv in v.items() if kk != "episodes"}
+            save[k] = {kk: vv for kk, vv in v.items() if kk != "episodes"}
         else:
-            save_results[k] = v
+            save[k] = v
     with open(out, "w") as f:
-        json.dump(save_results, f, indent=2)
-    print(f"\n[SAVE] Results saved to: {out}")
+        json.dump(save, f, indent=2)
+    print(f"\n[SAVE] {out}")

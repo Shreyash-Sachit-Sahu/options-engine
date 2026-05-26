@@ -1,476 +1,352 @@
 """
-Agent Evaluation & Benchmarking
+Agent Evaluation & Benchmarking — v2
 
-Comprehensive evaluation of the trained SAC agent vs all baselines.
-Computes Sharpe ratio, max drawdown, hedge error, transaction costs,
-and generates comparison results.
+Evaluates SAC agent vs all five baselines (Delta, Static,
+Leland, WhalleyWilmott, Random).
+
+METRIC CHANGE FROM v1:
+    Primary  = cross-episode Sharpe = mean(PnL) / std(PnL) * sqrt(252)
+    Secondary = mean of per-episode Sharpes (kept for reference only)
+
+    Rationale: per-episode Sharpes over 30-step windows have enormous
+    variance (observed range: -6 to +29 for the same agent). Their
+    mean is a noisy estimator and produced the misleading result that
+    StaticHedger > DeltaHedger in v1. Cross-episode Sharpe is the
+    correct metric — it measures whether the agent consistently
+    generates positive risk-adjusted PnL across independent scenarios.
+
+Comparison order (most to least theoretically sophisticated):
+    SAC > WhalleyWilmott > Leland > Delta > Static > Random
 """
 
-import os
-import sys
-import json
-import argparse
+import os, sys, json, argparse
 import numpy as np
 from pathlib import Path
-from typing import Dict, List
 from scipy import stats as scipy_stats
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from agent.gpu_utils import get_device, device_banner
-
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
 from environment.options_env import OptionsHedgingEnv
 from environment.baselines import (
     DeltaHedger, StaticHedger, RandomAgent,
-    run_baseline_episode, evaluate_agent
+    LelandHedger, WhalleyWilmottHedger,
+    evaluate_agent,
 )
+from gymnasium import Env
+from typing import Any
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAC evaluator
+# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_sac(model, vec_normalize_path: str, env_config: dict,
-                 n_episodes: int = 1000) -> dict:
+                 n_episodes: int = 500) -> dict:
     """
-    Evaluate trained SAC agent over multiple episodes.
+    Evaluate trained SAC agent.
 
-    Uses the saved VecNormalize statistics for consistent evaluation.
-    Each episode uses a different seed for diverse market scenarios.
+    Returns cross_episode_sharpe as the primary metric, plus
+    mean_episode_sharpe as secondary.
     """
-    all_rewards = []
-    all_pnls = []
-    all_drawdowns = []
-    all_sharpes = []
-    hedge_errors = []
-    all_actions = []
+    all_pnls, all_sharpes, all_drawdowns, hedge_errors, all_actions = (
+        [], [], [], [], []
+    )
 
     for ep in range(n_episodes):
-        # Create fresh env with unique seed per episode for diverse scenarios
-        ep_seed = 50000 + ep
-        ep_env_config = dict(env_config, seed=ep_seed)
-        env = DummyVecEnv([lambda cfg=ep_env_config: OptionsHedgingEnv(**cfg)])
+        ep_env_config: dict[str, Any] = dict(env_config, seed=50000 + ep)
+        def make_env()->"Env":
+            return OptionsHedgingEnv(**ep_env_config)
+        env = DummyVecEnv([make_env])
 
         if os.path.exists(vec_normalize_path):
             env = VecNormalize.load(vec_normalize_path, env)
-            env.training = False
+            env.training    = False
             env.norm_reward = False
         else:
-            env = VecNormalize(env, norm_obs=True, norm_reward=False, training=False)
+            env = VecNormalize(env, norm_obs=True, norm_reward=False,
+                               training=False)
 
-        obs = env.reset()
-        done = False
-        ep_reward = 0.0
+        obs, done = env.reset(), False
         ep_deltas = []
-        ep_actions = []
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            ep_actions.append(float(action[0][0]))
+            all_actions.append(float(action[0][0]))
 
-            # Track delta for hedge error computation
             raw_obs = env.get_original_obs()
             if raw_obs is not None:
-                delta = float(raw_obs[0][4])
-                hedge = float(action[0][0])
-                ep_deltas.append(abs(delta - hedge))
+                obs_arr = np.array(raw_obs)
+                ep_deltas.append(abs(float(obs_arr[0][4]) - float(action[0][0])))
 
-            obs, reward, done_arr, infos = env.step(action)
+            obs, _, done_arr, infos = env.step(action)
             done = done_arr[0]
-            ep_reward += reward[0]
-
-        all_rewards.append(ep_reward)
-        all_actions.extend(ep_actions)
 
         info = infos[0]
-        if "total_pnl" in info:
-            all_pnls.append(info["total_pnl"])
-        if "max_drawdown" in info:
-            all_drawdowns.append(info["max_drawdown"])
-        if "episode_sharpe" in info:
-            all_sharpes.append(info["episode_sharpe"])
+        if "total_pnl"     in info: all_pnls.append(info["total_pnl"])
+        if "max_drawdown"  in info: all_drawdowns.append(info["max_drawdown"])
+        if "episode_sharpe" in info: all_sharpes.append(info["episode_sharpe"])
+        if ep_deltas: hedge_errors.append(float(np.sqrt(np.mean(
+            np.array(ep_deltas) ** 2))))
 
-        if ep_deltas:
-            hedge_errors.append(np.sqrt(np.mean(np.array(ep_deltas) ** 2)))
-
-    rewards = np.array(all_rewards)
-    pnls = np.array(all_pnls) if all_pnls else rewards
-
-    # Use episode-level Sharpe as primary metric (more meaningful for hedging)
+    pnls    = np.array(all_pnls)
     pnl_std = float(np.std(pnls)) if len(pnls) > 1 else 1e-6
+
+    # ── PRIMARY metric ────────────────────────────────────────────────────
     cross_ep_sharpe = float(np.mean(pnls) / max(pnl_std, 1e-6) * np.sqrt(252))
-    ep_sharpe = float(np.mean(all_sharpes)) if all_sharpes else cross_ep_sharpe
 
     return {
-        "agent": "SAC",
-        "mean_reward": float(np.mean(rewards)),
-        "std_reward": float(np.std(rewards)),
-        "mean_pnl": float(np.mean(pnls)),
-        "std_pnl": pnl_std,
-        "sharpe_ratio": ep_sharpe,
-        "cross_episode_sharpe": cross_ep_sharpe,
-        "mean_episode_sharpe": ep_sharpe,
-        "mean_max_drawdown": float(np.mean(all_drawdowns)) if all_drawdowns else 0.0,
-        "max_max_drawdown": float(np.max(all_drawdowns)) if all_drawdowns else 0.0,
-        "mean_hedge_error": float(np.mean(hedge_errors)) if hedge_errors else 0.0,
-        "action_mean": float(np.mean(all_actions)),
-        "action_std": float(np.std(all_actions)),
-        "n_episodes": n_episodes,
-        "episode_pnls": [float(p) for p in pnls],
-        "episode_sharpes": [float(s) for s in all_sharpes],
+        "agent":                "SAC",
+        "n_episodes":           n_episodes,
+        "cross_episode_sharpe": cross_ep_sharpe,        # ← PRIMARY
+        "mean_episode_sharpe":  float(np.mean(all_sharpes)) if all_sharpes else 0.0,
+        "mean_pnl":             float(np.mean(pnls)),
+        "std_pnl":              pnl_std,
+        "mean_max_drawdown":    float(np.mean(all_drawdowns)) if all_drawdowns else 0.,
+        "max_max_drawdown":     float(np.max(all_drawdowns))  if all_drawdowns else 0.,
+        "mean_hedge_error":     float(np.mean(hedge_errors))  if hedge_errors  else 0.,
+        "action_mean":          float(np.mean(all_actions)),
+        "action_std":           float(np.std(all_actions)),
+        "episode_pnls":         [float(p) for p in pnls],
+        "episode_sharpes":      [float(s) for s in all_sharpes],
     }
 
 
-def bootstrap_sharpe_ci(pnls: np.ndarray, n_boot: int = 10_000,
-                        ci: float = 95.0, seed: int = 42) -> tuple:
-    """
-    Bootstrap confidence interval for Sharpe ratio.
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistics helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Resamples episode PnLs with replacement and recomputes Sharpe
-    each time. Returns (lower, upper) bounds of the CI.
-    This directly answers "is your Sharpe real or lucky?"
-    """
-    rng = np.random.default_rng(seed)
-    boot_sharpes = []
-    n = len(pnls)
+def bootstrap_ci(pnls: np.ndarray, n_boot: int = 10_000,
+                 ci: float = 95.0, seed: int = 42) -> tuple:
+    """Bootstrap CI on cross-episode Sharpe."""
+    rng  = np.random.default_rng(seed)
+    n    = len(pnls)
+    boot = []
     for _ in range(n_boot):
-        sample = rng.choice(pnls, size=n, replace=True)
-        s = float(np.mean(sample))  # sample is episode Sharpes — mean directly
-        boot_sharpes.append(s)
+        s = rng.choice(pnls, size=n, replace=True)
+        std = float(np.std(s))
+        boot.append(float(np.mean(s)) / max(std, 1e-6) * np.sqrt(252))
     lo = (100 - ci) / 2
-    return float(np.percentile(boot_sharpes, lo)), float(np.percentile(boot_sharpes, 100 - lo))
+    return float(np.percentile(boot, lo)), float(np.percentile(boot, 100 - lo))
 
 
-def transaction_cost_sweep(model, vec_normalize_path: str,
-                            base_env_config: dict,
-                            tc_levels: list = None,
-                            n_episodes: int = 200) -> dict:
+def paired_test(pnls_a: np.ndarray, pnls_b: np.ndarray) -> dict:
+    """Paired t-test on episode PnLs (not Sharpes — PnL is the raw quantity)."""
+    n      = min(len(pnls_a), len(pnls_b))
+    diff   = pnls_a[:n] - pnls_b[:n]
+    t, p   = scipy_stats.ttest_rel(pnls_a[:n], pnls_b[:n])
+    ci     = scipy_stats.t.interval(0.95, df=n-1,
+                                     loc=np.mean(diff),
+                                     scale=scipy_stats.sem(diff))
+    return {
+        "n":               n,
+        "mean_diff":       float(np.mean(diff)),
+        "t_stat":          float(t),
+        "p_value":         float(p),
+        "significant_5pct": bool(p < 0.05),
+        "ci_95_lo":        float(ci[0]),
+        "ci_95_hi":        float(ci[1]),
+    }
+
+
+def tc_sensitivity_sweep(model, vnorm_path: str, base_cfg: dict,
+                          tc_levels=None, n_episodes: int = 200) -> dict:
     """
-    Sweep transaction costs to find the breakeven point.
-
-    Tests the SAC agent at multiple TC levels and reports where
-    it stops beating delta hedging. This directly addresses the
-    'at what TC does the alpha disappear?' question.
-
-    Args:
-        tc_levels: List of TC rates to test (default: 5 levels 0→0.005)
+    Test SAC and Leland hedger across TC levels.
+    Answers: 'at what TC does the RL alpha vanish?'
     """
     if tc_levels is None:
-        tc_levels = [0.0, 0.0005, 0.001, 0.002, 0.005]
+        tc_levels = [0.0, 0.0005, 0.001, 0.002, 0.003, 0.005]
 
     results = {}
-    print(f"\n[TC SWEEP] Testing {len(tc_levels)} transaction cost levels...")
-
     for tc in tc_levels:
-        cfg = dict(base_env_config, transaction_cost=tc)
+        cfg : dict[str, Any] = dict(base_cfg, transaction_cost=tc)
+        sac  = evaluate_sac(model, vnorm_path, cfg, n_episodes)
+        env  = OptionsHedgingEnv(**cfg)
 
-        # SAC
-        sac_res  = evaluate_sac(model, vec_normalize_path, cfg, n_episodes)
-        sac_sharpe = sac_res["sharpe_ratio"]
+        leland = LelandHedger(sigma=cfg["sigma"], tc_rate=tc,
+                              K=cfg["K"], r=cfg["r"], T=cfg["T"])
+        delta  = DeltaHedger(K=cfg["K"], r=cfg["r"],
+                              sigma=cfg["sigma"], T=cfg["T"])
 
-        # Delta hedger at same TC
-        from environment.baselines import DeltaHedger, evaluate_agent
-        env = OptionsHedgingEnv(**cfg)
-        delta_agent = DeltaHedger(K=cfg["K"], r=cfg["r"],
-                                   sigma=cfg["sigma"], T=cfg["T"])
-        delta_res = evaluate_agent(env, delta_agent, n_episodes=n_episodes)
-        delta_sharpe = delta_res.get("mean_episode_sharpe",
-                                      delta_res.get("sharpe_ratio", 0.91))
+        lel_res   = evaluate_agent(env, leland, n_episodes)
+        delta_res = evaluate_agent(env, delta,  n_episodes)
 
-        outperf = (sac_sharpe / max(delta_sharpe, 1e-10) - 1) * 100
+        sac_sharpe   = sac["cross_episode_sharpe"]
+        lel_sharpe   = lel_res["cross_episode_sharpe"]
+        delta_sharpe = delta_res["cross_episode_sharpe"]
+
         results[tc] = {
             "sac_sharpe":   sac_sharpe,
+            "leland_sharpe": lel_sharpe,
             "delta_sharpe": delta_sharpe,
-            "outperformance_pct": outperf,
-            "sac_beats_delta": sac_sharpe > delta_sharpe,
+            "sac_vs_leland_pct":
+                (sac_sharpe / max(lel_sharpe, 1e-10) - 1) * 100,
+            "sac_vs_delta_pct":
+                (sac_sharpe / max(delta_sharpe, 1e-10) - 1) * 100,
         }
-        status = "✓" if sac_sharpe > delta_sharpe else "✗"
-        print(f"   TC={tc:.4f}: SAC={sac_sharpe:.3f}  Delta={delta_sharpe:.3f}"
-              f"  Outperf={outperf:+.1f}%  {status}")
+        print(f"  TC={tc:.4f}: SAC={sac_sharpe:.3f}  "
+              f"Leland={lel_sharpe:.3f}  Delta={delta_sharpe:.3f}")
 
-    # Find breakeven
-    breakeven = None
-    tc_list = sorted(results.keys())
-    for i in range(1, len(tc_list)):
-        if not results[tc_list[i]]["sac_beats_delta"]:
-            breakeven = tc_list[i]
-            break
-
-    if breakeven:
-        print(f"\n   Breakeven TC: ~{breakeven:.4f} "
-              f"(SAC stops beating delta above this level)")
-    else:
-        print(f"\n   SAC beats delta at all tested TC levels (up to {tc_list[-1]:.4f})")
-
-    results["breakeven_tc"] = breakeven
     return results
 
 
-def statistical_comparison(sac_pnls: np.ndarray,
-                            delta_pnls: np.ndarray) -> dict:
-    """
-    Paired t-test + bootstrap CI comparing SAC vs Delta PnL distributions.
+# ─────────────────────────────────────────────────────────────────────────────
+# Main evaluation runner
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns a dict suitable for printing and saving to JSON.
-    """
-    n = min(len(sac_pnls), len(delta_pnls))
-    sac_pnls, delta_pnls = sac_pnls[:n], delta_pnls[:n]
-    diffs = sac_pnls - delta_pnls
-
-    t_stat, p_value = scipy_stats.ttest_rel(sac_pnls, delta_pnls)
-
-    rng = np.random.default_rng(42)
-    boot_means = [np.mean(rng.choice(diffs, size=n, replace=True))
-                  for _ in range(10_000)]
-    ci_lo, ci_hi = np.percentile(boot_means, [2.5, 97.5])
-
-    return {
-        "n_episodes":       n,
-        "mean_diff":        float(np.mean(diffs)),
-        "t_stat":           float(t_stat),
-        "p_value":          float(p_value),
-        "significant_5pct": bool(p_value < 0.05),
-        "ci_95_lo":         float(ci_lo),
-        "ci_95_hi":         float(ci_hi),
-    }
+def _resolve_model(args):
+    paths = [
+        args.model_path,
+        "agent/models/best_heston/best_model",
+        "agent/models/sac_hedger_heston_final",
+        "agent/models/sac_hedger_final",
+    ]
+    for p in paths:
+        if os.path.exists(p) or os.path.exists(p + ".zip"):
+            return p
+    return paths[0]
 
 
-def run_full_evaluation(args):
-    """Run comprehensive evaluation of SAC vs all baselines."""
-    print("=" * 70)
-    print("  Options Hedging Agent - Full Evaluation")
-    print("=" * 70)
+def _resolve_vnorm(args):
+    paths = [
+        args.vnorm_path,
+        "agent/models/vec_normalize_heston.pkl",
+        "agent/models/vec_normalize.pkl",
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return paths[0]
 
-    env_config = {
-        "simulator_type": args.simulator,
-        "S0": 100.0,
-        "K": 100.0,
-        "T": 30 / 252,
-        "r": 0.05,
-        "sigma": 0.2,
-        "mu": 0.05,
-        "n_steps": 30,
-        "transaction_cost": 0.001,
-    }
 
-    if args.simulator == "heston":
-        env_config.update({
-            "kappa": 2.0, "theta": 0.04, "xi": 0.3, "rho": -0.7
-        })
+def run_full_evaluation(args) -> dict:
+    n_ep = args.n_episodes
+    sim  = args.simulator
 
-    n_episodes = args.n_episodes
+    env_config: dict[str, Any] = dict(
+        simulator_type   = sim,
+        S0=100., K=100., T=30/252, r=0.05, sigma=0.2,
+        n_steps=30, transaction_cost=0.003,
+        execution_delay=1, variable_tc=True,
+    )
+    if sim == "heston":
+        env_config.update(kappa=2.0, theta=0.04, xi=0.3, rho=-0.7)
 
-    # ─── Evaluate Baselines ───────────────────────────────────────────────
-    print(f"\n[EVAL] Evaluating baselines ({n_episodes} episodes each)...")
-
-    env = OptionsHedgingEnv(**env_config)
-
-    agents = {
-        "DeltaHedger": DeltaHedger(K=100.0, r=0.05, sigma=0.2, T=30/252),
-        "StaticHedger": StaticHedger(),
-        "RandomAgent": RandomAgent(seed=42),
-    }
-
+    device_banner()
     results = {}
-    for name, agent in agents.items():
-        print(f"   Evaluating {name}...")
-        result = evaluate_agent(env, agent, n_episodes=n_episodes)
-        result["agent"] = name
-        # Use mean_episode_sharpe (within-episode) to match SAC's metric
-        result["sharpe_ratio"] = result["mean_episode_sharpe"]
-        results[name] = result
-        print(f"   [OK] {name}: Sharpe={result['sharpe_ratio']:.4f}, "
-              f"PnL={result['mean_pnl']:.4f}")
 
-    # ─── Evaluate SAC ─────────────────────────────────────────────────────
-    # ── Smart model path resolution ──────────────────────────────────────
-    # Priority: 1) explicit --model-path  2) best_<sim>/best_model
-    #           3) sac_hedger_<sim>_final  4) generic sac_hedger_final
-    sim_tag    = args.simulator.lower()
-    model_dir  = Path(args.model_path).parent
-    vnorm_path = args.vnorm_path
+    # ── Baseline evaluations ──────────────────────────────────────────────
+    baseline_specs = [
+        ("DeltaHedger",        DeltaHedger(sigma=0.2, K=100., r=0.05, T=30/252)),
+        ("LelandHedger",       LelandHedger(sigma=0.2, tc_rate=0.003,
+                                            K=100., r=0.05, T=30/252)),
+        ("WhalleyWilmottHedger", WhalleyWilmottHedger(sigma=0.2, tc_rate=0.003,
+                                                       K=100., r=0.05, T=30/252)),
+        ("StaticHedger",       StaticHedger()),
+        ("RandomAgent",        RandomAgent(42)),
+    ]
 
-    _default_model_path = "agent/models/sac_hedger_final"
+    for name, agent in baseline_specs:
+        print(f"\n[BASELINE] Evaluating {name}...")
+        env = OptionsHedgingEnv(**env_config)
+        res = evaluate_agent(env, agent, n_episodes=n_ep)
+        res["agent"] = name
+        results[name] = res
+        print(f"   Cross-ep Sharpe: {res['cross_episode_sharpe']:.4f}  "
+              f"Mean PnL: {res['mean_pnl']:.4f}")
 
-    def _resolve_model() -> str:
-        # Only use explicit --model-path if the user actually changed it
-        # from the default. Otherwise, prefer the sim-tagged model.
-        user_explicit = args.model_path != _default_model_path
-        candidates = []
-        if user_explicit:
-            candidates.append(args.model_path)
-        candidates += [
-            str(model_dir / f"best_{sim_tag}" / "best_model"),   # best checkpoint
-            str(model_dir / f"sac_hedger_{sim_tag}_final"),       # sim-tagged final
-        ]
-        if not user_explicit:
-            candidates.append(args.model_path)                    # generic last resort
-        for c in candidates:
-            if os.path.exists(c + ".zip") or os.path.exists(c):
-                return c
-        return args.model_path   # will fail gracefully below
+    # ── SAC evaluation ────────────────────────────────────────────────────
+    model_path = _resolve_model(args)
+    vnorm_path = _resolve_vnorm(args)
+    print(f"\n[MODEL] {model_path}")
+    print(f"[VNORM] {vnorm_path}")
 
-    _default_vnorm_path = "agent/models/vec_normalize.pkl"
-
-    def _resolve_vnorm() -> str:
-        user_explicit = args.vnorm_path != _default_vnorm_path
-        candidates = []
-        if user_explicit:
-            candidates.append(args.vnorm_path)
-        candidates.append(str(model_dir / f"vec_normalize_{sim_tag}.pkl"))
-        if not user_explicit:
-            candidates.append(args.vnorm_path)
-        for c in candidates:
-            if os.path.exists(c):
-                return c
-        return args.vnorm_path
-
-    model_path = _resolve_model()
-    vnorm_path = _resolve_vnorm()
-    print(f"[MODEL] Loading: {model_path}")
-    print(f"[VNORM] Loading: {vnorm_path}")
-
-    # Sanity check: warn if vnorm obs dim doesn't match current env
-    try:
-        import pickle
-        with open(vnorm_path, "rb") as _f:
-            _vn = pickle.load(_f)
-        _vnorm_dim = len(_vn.obs_rms.mean)
-        _env_dim   = 11  # current obs space after expansion
-        if _vnorm_dim != _env_dim:
-            sep = "=" * 70
-            print(f"\n{sep}")
-            print(f"  [CRITICAL] OBS DIMENSION MISMATCH")
-            print(f"  VecNormalize has {_vnorm_dim}-dim stats but env expects {_env_dim}-dim.")
-            print(f"  This model was trained BEFORE the obs space expansion.")
-            print(f"  Results will be UNRELIABLE. You must retrain:")
-            print(f"    python agent/train.py --simulator {sim_tag} --total-timesteps 500000")
-            print(f"{sep}\n")
-    except Exception:
-        pass
-
-    if os.path.exists(model_path + ".zip") or os.path.exists(model_path):
-        print(f"\n[SAC] Evaluating SAC agent...")
+    if os.path.exists(model_path) or os.path.exists(model_path + ".zip"):
         device = get_device(verbose=True)
-        actual_path = model_path if os.path.exists(model_path) else model_path
-        model = SAC.load(actual_path, device=device)   # ← load weights onto GPU
-        sac_result = evaluate_sac(model, vnorm_path, env_config, n_episodes)
-        results["SAC"] = sac_result
-        print(f"   [OK] SAC: Sharpe={sac_result['sharpe_ratio']:.4f}, "
-              f"PnL={sac_result['mean_pnl']:.4f}")
+        model  = SAC.load(model_path, device=device)
+        sac    = evaluate_sac(model, vnorm_path, env_config, n_ep)
+        results["SAC"] = sac
+        print(f"\n[SAC] Cross-ep Sharpe: {sac['cross_episode_sharpe']:.4f}  "
+              f"Mean PnL: {sac['mean_pnl']:.4f}")
     else:
-        print(f"\n[WARN] No trained SAC model found at: {model_path}")
-        print(f"   Run train.py first to train the agent.")
+        print(f"\n[WARN] No model at {model_path} — skipping SAC eval.")
 
-    # ─── Comparison Table ─────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("  RESULTS COMPARISON")
-    print("=" * 70)
-    print(f"\n{'Agent':<15} {'Sharpe':>10} {'Mean PnL':>12} {'Std PnL':>10} "
-          f"{'MaxDD':>10} {'vs Delta':>10}")
-    print("-" * 70)
+    # ── Comparison table ──────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  RESULTS  (PRIMARY = cross-episode Sharpe)")
+    print("=" * 72)
+    print(f"\n{'Agent':<22} {'XEP Sharpe':>12} {'Mean PnL':>12} "
+          f"{'Std PnL':>10} {'MaxDD':>10}")
+    print("-" * 72)
 
-    delta_sharpe = results.get("DeltaHedger", {}).get("sharpe_ratio", 1.0)
-
-    for name in ["SAC", "DeltaHedger", "StaticHedger", "RandomAgent"]:
+    rank_order = ["SAC", "WhalleyWilmottHedger", "LelandHedger",
+                  "DeltaHedger", "StaticHedger", "RandomAgent"]
+    for name in rank_order:
         if name not in results:
             continue
         r = results[name]
-        vs_delta = r["sharpe_ratio"] / (delta_sharpe + 1e-10)
-        pct_str = f"{vs_delta:.2f}x"
-        print(f"{name:<15} {r['sharpe_ratio']:>10.4f} {r['mean_pnl']:>12.4f} "
-              f"{r.get('std_pnl', 0):>10.4f} "
-              f"{r.get('mean_max_drawdown', 0):>10.4f} {pct_str:>10}")
+        print(f"{name:<22} "
+              f"{r['cross_episode_sharpe']:>12.4f} "
+              f"{r['mean_pnl']:>12.4f} "
+              f"{r['std_pnl']:>10.4f} "
+              f"{r.get('mean_max_drawdown', 0):>10.4f}")
 
-    # ─── Bootstrap CI on SAC Sharpe ──────────────────────────────────────
-    if "SAC" in results and results["SAC"].get("episode_sharpes"):
-        sac_sharpes = np.array(results["SAC"].get("episode_sharpes", []))   # ← add this line 
-        sac_pnls    = np.array(results["SAC"]["episode_pnls"])
-        ci_lo, ci_hi = bootstrap_sharpe_ci(sac_sharpes) if len(sac_sharpes) > 0 else (0.0, 0.0)
-        print(f"\n[STATS] SAC Sharpe 95% CI (bootstrap, n=10k): "
-              f"[{ci_lo:.3f}, {ci_hi:.3f}]")
-
-        # Paired t-test vs delta
-        delta_sharpes = np.array(results.get("DeltaHedger", {}).get("episode_sharpes", []))
-        if len(delta_sharpes) > 0 and len(sac_sharpes) > 0:
-            stats = statistical_comparison(sac_sharpes, delta_sharpes)
-            results["statistics"] = stats
-            sig = "YES ✓" if stats["significant_5pct"] else "NO ✗"
-            print(f"[STATS] SAC vs Delta paired t-test:")
-            print(f"   Mean Sharpe diff : {stats['mean_diff']:+.6f}")
-            print(f"   95% CI        : [{stats['ci_95_lo']:+.6f}, {stats['ci_95_hi']:+.6f}]")
-            print(f"   p-value       : {stats['p_value']:.4f}  (significant: {sig})")
-
-    # ─── Transaction Cost Sensitivity ────────────────────────────────────
-    if "SAC" in results and not args.skip_tc_sweep:
-        print(f"\n[TC SWEEP] Analysing TC sensitivity...")
-        try:
-            resolved_path = _resolve_model()
-            device = get_device(verbose=False)
-            model = SAC.load(resolved_path, device=device)
-            tc_results = transaction_cost_sweep(
-                model, _resolve_vnorm(), env_config,
-                tc_levels=[0.0, 0.0005, 0.001, 0.002, 0.003, 0.005],
-                n_episodes=200,
-            )
-            results["tc_sensitivity"] = {
-                str(k): v for k, v in tc_results.items()
-            }
-        except Exception as e:
-            print(f"[WARN] TC sweep failed: {e}")
-
-    # ─── Save Results ─────────────────────────────────────────────────────
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Ensure all data is JSON-serializable (convert numpy arrays/lists)
-    serializable_results = {}
-    for name, res in results.items():
-        serializable_results[name] = {
-            k: ([float(x) for x in v] if isinstance(v, (list, np.ndarray)) and k.startswith("episode_") else v)
-            for k, v in res.items()
-        }
-
-    with open(output_path, "w") as f:
-        json.dump(serializable_results, f, indent=2)
-
-    print(f"\n[SAVE] Results saved to: {output_path}")
-
-    # ─── Target Check ─────────────────────────────────────────────────────
+    # ── Statistical comparison: SAC vs each classical baseline ───────────
+    stats_block = {}
     if "SAC" in results:
-        sac_sharpe = results["SAC"]["sharpe_ratio"]
-        print(f"\n[TARGET] Target Check:")
-        print(f"   SAC Sharpe: {sac_sharpe:.4f} (target: > 1.4)")
-        print(f"   vs Delta: {sac_sharpe / (delta_sharpe + 1e-10):.2f}x "
-              f"(target: > 1.55x)")
+        sac_pnls = np.array(results["SAC"]["episode_pnls"])
+        for name in ["DeltaHedger", "LelandHedger", "WhalleyWilmottHedger"]:
+            if name not in results:
+                continue
+            other_pnls = np.array(results[name]["episode_pnls"])
+            st = paired_test(sac_pnls, other_pnls)
+            stats_block[f"SAC_vs_{name}"] = st
+            sig = "✓" if st["significant_5pct"] else "✗"
+            print(f"\n[STATS] SAC vs {name}: "
+                  f"mean_diff={st['mean_diff']:+.4f}  "
+                  f"p={st['p_value']:.4f}  {sig}")
 
-        if sac_sharpe > 1.4:
-            print("   [PASS] TARGET MET!")
-        else:
-            print("   [FAIL] Below target - consider more training or hyperparameter tuning")
+        # Bootstrap CI on SAC cross-episode Sharpe
+        ci_lo, ci_hi = bootstrap_ci(sac_pnls)
+        print(f"\n[CI] SAC cross-ep Sharpe 95% bootstrap CI: "
+              f"[{ci_lo:.3f}, {ci_hi:.3f}]")
+        results["statistics"] = stats_block
 
+    # ── TC sensitivity (optional) ─────────────────────────────────────────
+    if "SAC" in results and not args.skip_tc_sweep:
+        print("\n[TC SWEEP]")
+        model_path = _resolve_model(args)
+        device     = get_device(verbose=False)
+        model      = SAC.load(model_path, device=device)
+        tc_res     = tc_sensitivity_sweep(model, vnorm_path, env_config,
+                                          n_episodes=200)
+        results["tc_sensitivity"] = {str(k): v for k, v in tc_res.items()}
+
+    # ── Save ─────────────────────────────────────────────────────────────
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(results, f, indent=2,
+                  default=lambda x: float(x) if hasattr(x, '__float__') else x)
+    print(f"\n[SAVE] {out}")
     return results
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate hedging agents")
-    parser.add_argument("--device", type=str, default="auto",
-                        choices=["auto", "cuda", "mps", "cpu"],
-                        help="Compute device for SAC inference (default: auto)")
-    parser.add_argument("--simulator", type=str, default="gbm",
-                        choices=["gbm", "heston", "jump"])
-    parser.add_argument("--n-episodes", type=int, default=1000,
-                        help="Number of evaluation episodes")
-    parser.add_argument("--model-path", type=str,
-                        default="agent/models/sac_hedger_final",
-                        help="Path to trained SAC model")
-    parser.add_argument("--vnorm-path", type=str,
-                        default="agent/models/vec_normalize.pkl",
-                        help="Path to VecNormalize stats")
-    parser.add_argument("--output", type=str,
-                        default="agent/evaluation_results.json",
-                        help="Output JSON path")
-    parser.add_argument("--skip-tc-sweep", action="store_true",
-                        help="Skip transaction cost sensitivity sweep (faster)")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device",        default="auto",
+                        choices=["auto","cuda","mps","cpu"])
+    parser.add_argument("--simulator",     default="heston",
+                        choices=["gbm","heston","jump","regime"])
+    parser.add_argument("--n-episodes",    type=int, default=500)
+    parser.add_argument("--model-path",    default="agent/models/best_heston/best_model")
+    parser.add_argument("--vnorm-path",    default="agent/models/vec_normalize_heston.pkl")
+    parser.add_argument("--output",        default="agent/evaluation_results.json")
+    parser.add_argument("--skip-tc-sweep", action="store_true")
     args = parser.parse_args()
     run_full_evaluation(args)

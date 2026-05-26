@@ -120,7 +120,7 @@ class TestIVEndpoint:
 class TestAgentEndpoint:
     def test_agent_action(self):
         resp = client.post("/agent/action", json={
-            "observation": [1.0, 1.0, 0.5, 0.2, 0.55, 2.1, 0.0, 9.7, 1.9, 1.0, 0.0]
+            "observation": [1.0, 1.0, 0.5, 0.2, 0.55, 2.1, 0.0, 9.7, 1.9, 1.0, 0.0, 0.5]
         })
         assert resp.status_code == 200
         data = resp.json()

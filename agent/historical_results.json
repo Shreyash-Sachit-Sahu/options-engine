@@ -1,31 +1,69 @@
 {
   "DeltaHedger": {
-    "n_episodes": 44,
-    "mean_sharpe": 0.19629784641857226,
-    "std_sharpe": 0.3098529344250215,
-    "mean_pnl": 0.08792403116899618,
-    "std_pnl": 0.1136399114537831,
-    "sharpe_ratio": 0.19629784641857226,
-    "sharpe_ratio_cross_ep": 0.7737073178500654,
-    "max_max_drawdown": 0.4077119422443607
+    "n_episodes": 468,
+    "sharpe_ratio": 0.2032151123289349,
+    "cross_ep_sharpe": 0.2861251830396352,
+    "mean_pnl": 0.04800675242035249,
+    "std_pnl": 0.16778233877124293,
+    "mean_sharpe": 0.2032151123289349,
+    "std_sharpe": 0.4272021109905227,
+    "max_max_drawdown": 1.1640880017213417
+  },
+  "LelandHedger": {
+    "n_episodes": 468,
+    "sharpe_ratio": -0.021877817472500845,
+    "cross_ep_sharpe": -0.19931072658528187,
+    "mean_pnl": -0.20826957542520755,
+    "std_pnl": 1.0449491553890917,
+    "mean_sharpe": -0.021877817472500845,
+    "std_sharpe": 0.20868125399370432,
+    "max_max_drawdown": 3.412579026005827
+  },
+  "WhalleyWilmottHedger": {
+    "n_episodes": 468,
+    "sharpe_ratio": 0.09779798966692965,
+    "cross_ep_sharpe": 0.26723174808394984,
+    "mean_pnl": 0.04600962740091005,
+    "std_pnl": 0.17217126222492518,
+    "mean_sharpe": 0.09779798966692965,
+    "std_sharpe": 0.19084209109232184,
+    "max_max_drawdown": 1.0360496591203647
   },
   "SAC": {
-    "n_episodes": 44,
-    "mean_sharpe": 0.29079978866512224,
-    "std_sharpe": 0.4306077413638095,
-    "mean_pnl": 0.1498945629803483,
-    "std_pnl": 0.14486003419448767,
-    "sharpe_ratio": 0.29079978866512224,
-    "sharpe_ratio_cross_ep": 1.0347544352752662,
-    "max_max_drawdown": 0.4418105496262351
+    "n_episodes": 468,
+    "sharpe_ratio": 0.295347168626884,
+    "cross_ep_sharpe": 0.35162992863335246,
+    "mean_pnl": 0.075399595798044,
+    "std_pnl": 0.2144288344735889,
+    "mean_sharpe": 0.295347168626884,
+    "std_sharpe": 0.5786988551135412,
+    "max_max_drawdown": 1.3603302094406333
   },
-  "statistics": {
-    "t_stat": 4.834863289313934,
-    "p_value": 1.7352579569358125e-05,
-    "mean_pnl_diff": 0.06197053181135215,
-    "ci_95_lo": 0.037700058143610854,
-    "ci_95_hi": 0.08741029483807954,
-    "significant_5pct": true,
-    "sharpe_outperformance_pct": 48.14211870926002
+  "stats_SAC_vs_DeltaHedger": {
+    "t_stat": 8.223222619869631,
+    "p_value": 1.9793721104109623e-15,
+    "mean_diff": 0.02739284337769154,
+    "ci_lo": 0.0027590343230268544,
+    "ci_hi": 0.05188370636231044,
+    "sig": true,
+    "outperf_pct": 45.337207081734746
+  },
+  "stats_SAC_vs_LelandHedger": {
+    "t_stat": 5.305995121647855,
+    "p_value": 1.7344951111497385e-07,
+    "mean_diff": 0.2836691712232516,
+    "ci_lo": 0.18770070247110465,
+    "ci_hi": 0.3819646633091643,
+    "sig": true,
+    "outperf_pct": 295347168526.884
+  },
+  "stats_SAC_vs_WhalleyWilmottHedger": {
+    "t_stat": 4.89713775784314,
+    "p_value": 1.3423415407728597e-06,
+    "mean_diff": 0.029389968397133953,
+    "ci_lo": 0.004286897350194763,
+    "ci_hi": 0.05405513115880398,
+    "sig": true,
+    "outperf_pct": 201.9971776850905
   }
 }
