@@ -149,13 +149,13 @@ jobs:
         with:
           name: pricer-module
 
-      - name: Verify obs space is 11-dim
+      - name: Verify obs space is 12-dim
         run: |
           python -c "
           from environment.options_env import OptionsHedgingEnv
           env = OptionsHedgingEnv()
           obs, _ = env.reset(seed=42)
-          assert obs.shape == (11,), f'Expected 11-dim obs, got {obs.shape}'
+          assert obs.shape == (12,), f'Expected 12-dim obs, got {obs.shape}'
           print(f'Obs space: {env.observation_space.shape} — OK')
           "
 
